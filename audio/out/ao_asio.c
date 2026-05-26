@@ -570,7 +570,7 @@ static int pick_sample_type(struct asio_state *s)
         default:                wanted = native;           break;
         }
         if (wanted != native) {
-            MP_ERR(s, "ASIO driver uses %s but --ao-asio-sample-type forces "
+            MP_ERR(s, "ASIO driver uses %s but --asio-sample-type forces "
                    "a different type. The driver does not allow this.\n",
                    sample_type_name(native));
             return -1;
@@ -621,7 +621,7 @@ static int init(struct ao *ao)
     s->com_initialized = SUCCEEDED(hr);
 
     // Resolve driver name: --audio-device=asio/<name> stripped to <name>
-    // is in ao->device; --ao-asio-device is the explicit option.
+    // is in ao->device; --asio-device is the explicit option.
     const char *wanted = (ao->device && ao->device[0]) ? ao->device
                                                        : s->opt_device;
     wchar_t wname[ASIO_NAME_MAX] = {0};
