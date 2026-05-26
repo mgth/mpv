@@ -662,15 +662,19 @@ static int init(struct ao *ao)
     }
     int avail = (int)s->num_out - s->channel_offset;
 
-    // Channel layout negotiation: advertise all channel counts the driver
-    // can physically provide. mpv's filter chain picks the best match.
+    // Channel layout negotiation: advertise the full waveext set (mono up to
+    // 9.1.6, including 5.1.4 and 7.1.4 height layouts) so spatial inputs
+    // (Atmos beds + objects rendered to N speakers) aren't downmixed to 7.1
+    // before they reach the driver. waveext also forces a stable, well-known
+    // channel order that ASIO drivers expose on their physical outputs.
+    // mp_chmap_from_channels only knows layouts up to 7.1 (default_layouts[]
+    // stops at 8) so it would otherwise cap the negotiated output at 8 ch.
     struct mp_chmap_sel chmap_sel = {0};
-    for (int nch = 1; nch <= avail && nch <= MP_NUM_CHANNELS; nch++) {
-        struct mp_chmap c;
-        mp_chmap_from_channels(&c, nch);
-        if (mp_chmap_is_valid(&c))
-            mp_chmap_sel_add_map(&chmap_sel, &c);
-    }
+    mp_chmap_sel_add_waveext(&chmap_sel);
+    // Also accept any chmap that fits the available physical outputs — covers
+    // unusual driver configurations (e.g. 24-ch MOTU surfaces).
+    if (avail > 0)
+        chmap_sel.allow_any = true;
     if (!ao_chmap_sel_adjust(ao, &chmap_sel, &ao->channels)) {
         MP_ERR(ao, "Could not negotiate a channel layout within the %d "
                "available ASIO output channels\n", avail);
