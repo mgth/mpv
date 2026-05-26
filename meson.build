@@ -691,6 +691,13 @@ if features['libarchive']
                      'stream/stream_libarchive.c')
 endif
 
+orender = dependency('orender', version: '>= 0.1', required: get_option('orender'))
+features += {'orender': orender.found()}
+if features['orender']
+    dependencies += orender
+    sources += files('audio/decode/ad_orender.c')
+endif
+
 libavdevice = dependency('libavdevice', version: '>= 60.3.100', required: get_option('libavdevice'))
 features += {'libavdevice': libavdevice.found()}
 if features['libavdevice']
