@@ -435,7 +435,12 @@ static bool search_channels(struct ao *ao, WAVEFORMATEXTENSIBLE *wformat)
     struct wasapi_state *state = ao->priv;
     struct mp_chmap_sel chmap_sel = {.tmp = state};
     struct mp_chmap entry;
-    // put common layouts first so that we find sample rate/format early
+    // put common layouts first so that we find sample rate/format early.
+    // Height layouts (5.1.4 / 7.1.4 / 9.1.6) are at the end so the loop
+    // exits as soon as the driver rejects them on hardware that caps at
+    // 7.1, but lets pro multi-channel devices (e.g. MOTU 24Ao in WASAPI
+    // exclusive) negotiate the full speaker count instead of being
+    // downmixed to octagonal (8 ch).
     char *channel_layouts[] =
         {"stereo", "5.1", "7.1", "6.1", "mono", "2.1", "4.0", "5.0",
          "3.0", "3.0(back)",
@@ -443,7 +448,13 @@ static bool search_channels(struct ao *ao, WAVEFORMATEXTENSIBLE *wformat)
          "5.0(side)", "4.1",
          "5.1(side)", "6.0", "6.0(front)", "hexagonal",
          "6.1(back)", "6.1(front)", "7.0", "7.0(front)",
-         "7.1(wide)", "7.1(wide-side)", "7.1(rear)", "octagonal", NULL};
+         "7.1(wide)", "7.1(wide-side)", "7.1(rear)", "octagonal",
+         // Surround layouts with height channels — not in std_layout_names[],
+         // mp_chmap_from_str parses the raw "fl-fr-…" speaker lists directly.
+         "fl-fr-fc-lfe-bl-br-tfl-tfr-tbl-tbr",                 // 5.1.4 (10)
+         "fl-fr-fc-lfe-bl-br-sl-sr-tfl-tfr-tbl-tbr",           // 7.1.4 (12)
+         "fl-fr-fc-lfe-bl-br-sl-sr-flc-frc-tfl-tfr-tsl-tsr-tbl-tbr", // 9.1.6
+         NULL};
 
     wformat->Format.nSamplesPerSec = 0;
     for (int j = 0; channel_layouts[j]; j++) {
