@@ -469,6 +469,28 @@ static bool search_channels(struct ao *ao, WAVEFORMATEXTENSIBLE *wformat)
         }
     }
 
+    // Pro multi-channel devices (MOTU 24Ao, RME MADI, …) expose raw N-channel
+    // formats beyond the named layouts above. Try every count from 17 up to
+    // the mpv cap as "discrete": unknown speaker map + a fake-full channel
+    // mask (mp_chmap_to_lavc_unchecked returns 2^N − 1 for unknown layouts).
+    // Many WASAPI drivers reject dwChannelMask=0 outright, so the fake mask
+    // is what makes the driver accept the format. Drivers without that many
+    // physical outputs just fail try_format_exclusive — no harm done.
+    for (int n = 17; n <= MP_NUM_CHANNELS; n++) {
+        struct mp_chmap discrete;
+        mp_chmap_set_unknown(&discrete, n);
+        if (!wformat->Format.nSamplesPerSec) {
+            if (search_samplerates(ao, wformat, &discrete))
+                mp_chmap_sel_add_map(&chmap_sel, &discrete);
+        } else {
+            wformat->Format.nChannels = discrete.num;
+            wformat->dwChannelMask    = mp_chmap_to_lavc_unchecked(&discrete);
+            update_waveformat_datarate(wformat);
+            if (try_format_exclusive(ao, wformat))
+                mp_chmap_sel_add_map(&chmap_sel, &discrete);
+        }
+    }
+
     entry = ao->channels;
     if (ao_chmap_sel_adjust2(ao, &chmap_sel, &entry, !state->opt_exclusive)){
         change_waveformat_channels(wformat, &entry);
