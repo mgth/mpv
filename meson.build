@@ -676,7 +676,8 @@ orender = dependency('orender', version: '>= 0.1', required: get_option('orender
 features += {'orender': orender.found()}
 if features['orender']
     dependencies += orender
-    sources += files('audio/decode/ad_orender.c')
+    sources += files('audio/decode/ad_orender.c',
+                     'player/orender_overlay.c')
 endif
 
 libavdevice = dependency('libavdevice', version: '>= 60.3.100', required: get_option('libavdevice'))
