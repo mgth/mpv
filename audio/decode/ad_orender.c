@@ -26,6 +26,7 @@
 #include "audio/chmap.h"
 #include "audio/format.h"
 #include "common/codecs.h"
+#include "common/common.h"
 #include "common/msg.h"
 #include "demux/packet.h"
 #include "demux/stheader.h"
@@ -49,6 +50,7 @@ struct ad_orender_params {
     int osc_rx_port;            // incoming control port  (0 = config/default 9000)
     char *osc_bind;             // listener bind address (else config/default)
     char *osc_monitor_target;   // monitoring host (else config/default)
+    int channel_mode_idx;       // non-object render override: 0=auto 1=host 2=direct 3=virtual
 };
 
 const struct m_sub_options ad_orender_conf = {
@@ -60,6 +62,12 @@ const struct m_sub_options ad_orender_conf = {
         {"osc-rx-port", OPT_INT(osc_rx_port), M_RANGE(0, 65535)},
         {"osc-bind", OPT_STRING(osc_bind)},
         {"osc-monitor-target", OPT_STRING(osc_monitor_target)},
+        /* How to render channel-based (non-object) content. Empty = follow the
+         * shared config's render.channel_render_mode. "host" hands the track
+         * back to mpv's native decoder; "direct"/"virtual" render it via
+         * orender. */
+        {"channel-mode", OPT_CHOICE(channel_mode_idx,
+            {"auto", 0}, {"host", 1}, {"direct", 2}, {"virtual", 3})},
         {0}
     },
     .size = sizeof(struct ad_orender_params),
@@ -91,6 +99,7 @@ struct priv {
     int channels;
     struct mp_chmap chmap;
     bool checked_spatial;
+    bool want_fallback;   // decline → wrapper re-selects the native decoder
     struct mp_decoder public;
 };
 
@@ -163,9 +172,31 @@ static void ad_orender_reset(struct mp_filter *da)
     p->checked_spatial = false;
 }
 
+/* Decoder control: lets the wrapper poll whether we want to be replaced by the
+ * native decoder (channel-mode=host on a plain stream, or no output layout). */
+static int ad_orender_control(struct mp_filter *da, enum dec_ctrl cmd, void *arg)
+{
+    struct priv *p = da->priv;
+    switch (cmd) {
+    case ADCTRL_CHECK_FALLBACK:
+        return p->want_fallback ? CONTROL_TRUE : CONTROL_FALSE;
+    default:
+        return CONTROL_UNKNOWN;
+    }
+}
+
 static void ad_orender_process(struct mp_filter *da)
 {
     struct priv *p = da->priv;
+
+    // Already decided to hand the track back to mpv's native decoder: stop
+    // consuming and emitting. Producing silence frames here would mask the empty
+    // output that the wrapper polls to trigger the fallback (read_frame only
+    // checks ADCTRL_CHECK_FALLBACK when no frame is produced), so the decoder
+    // would otherwise stay selected and play silence. Leaving the packets unread
+    // keeps them available for ad_lavc after the wrapper re-selects it.
+    if (p->want_fallback)
+        return;
 
     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
         return;
@@ -218,13 +249,36 @@ static void ad_orender_process(struct mp_filter *da)
     /* Resolve spatial-vs-plain + the output chmap on the first decoded packet. */
     if (!p->checked_spatial) {
         p->checked_spatial = true;
-        if (orender_is_spatial(p->renderer) != 1) {
-            MP_WARN(da, "no spatial objects detected; rendering the bed only "
-                        "(decode this track without --ad=orender for the "
-                        "standard downmix)\n");
+        bool spatial = orender_is_spatial(p->renderer) == 1;
+        int mode = orender_channel_mode(p->renderer); /* 0 host,1 direct,2 virtual */
+        if (!spatial && mode == 0) {
+            /* channel-mode=host on a plain multichannel stream: hand the track
+             * back to mpv's native decoder (the wrapper polls want_fallback and
+             * re-selects ad_lavc). This is the explicit "let mpv deal with it"
+             * path. */
+            MP_VERBOSE(da, "channel-mode=host on a non-object stream; "
+                           "handing back to the native decoder\n");
+            p->want_fallback = true;
+            goto done;
         }
-        if (!build_chmap(p))
+        if (!spatial) {
+            MP_VERBOSE(da, "no spatial objects; rendering channels via "
+                           "channel-mode=%s\n", mode == 1 ? "direct" : "virtual");
+        }
+        if (!build_chmap(p)) {
+            if (p->chmap.num == 0) {
+                /* The renderer reported no output channels (e.g. the speaker
+                 * layout could not be resolved). Rather than drop every frame —
+                 * which stalls the audio output and freezes playback — hand the
+                 * track back to mpv's native decoder. */
+                MP_WARN(da, "renderer reported no output layout; handing back "
+                            "to the native decoder (check the speaker layout in "
+                            "your omniphony config)\n");
+                p->want_fallback = true;
+                goto done;
+            }
             MP_WARN(da, "output layout has speakers with no mpv mapping\n");
+        }
     }
 
     if (n_frames == 0)
@@ -320,6 +374,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->codec = codec;
     p->sample_rate = codec->samplerate;
     p->public.f = da;
+    p->public.control = ad_orender_control;
 
     struct ad_orender_params *opts =
         mp_get_config_group(da, da->global, &ad_orender_conf);
@@ -362,6 +417,12 @@ static struct mp_decoder *create(struct mp_filter *parent,
         talloc_free(da);
         return NULL;
     }
+
+    /* Per-invocation override of the shared config's channel render mode.
+     * Option indices: 0=auto (follow config), 1=host, 2=direct, 3=virtual;
+     * the FFI mode codes are 0=host, 1=direct, 2=virtual. */
+    if (opts->channel_mode_idx > 0)
+        orender_set_channel_mode(p->renderer, opts->channel_mode_idx - 1);
 
     p->channels = orender_channel_count(p->renderer);
     codec->codec_desc = is_eac3 ? "eac3 (orender, spatial)"
