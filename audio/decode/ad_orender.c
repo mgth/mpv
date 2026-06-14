@@ -356,9 +356,9 @@ static struct mp_decoder *create(struct mp_filter *parent,
                                  const char *decoder)
 {
     if (!codec->codec ||
-        (strcmp(codec->codec, "truehd") != 0 && strcmp(codec->codec, "eac3") != 0))
+        (strcmp(codec->codec, "truehd") != 0 && strcmp(codec->codec, "eac3") != 0 &&
+         strcmp(codec->codec, "dts") != 0))
         return NULL;
-    bool is_eac3 = strcmp(codec->codec, "eac3") == 0;
 
     struct mp_filter *da = mp_filter_create(parent, &ad_orender_filter);
     if (!da)
@@ -425,8 +425,12 @@ static struct mp_decoder *create(struct mp_filter *parent,
         orender_set_channel_mode(p->renderer, opts->channel_mode_idx - 1);
 
     p->channels = orender_channel_count(p->renderer);
-    codec->codec_desc = is_eac3 ? "eac3 (orender, spatial)"
-                                : "truehd (orender, spatial)";
+    if (strcmp(codec->codec, "eac3") == 0)
+        codec->codec_desc = "eac3 (orender, spatial)";
+    else if (strcmp(codec->codec, "dts") == 0)
+        codec->codec_desc = "dts (orender, spatial)";
+    else
+        codec->codec_desc = "truehd (orender, spatial)";
 
     return &p->public;
 }
@@ -436,6 +440,8 @@ static void add_decoders(struct mp_decoder_list *list)
     mp_add_decoder(list, "truehd", "orender",
                    "Spatial audio via liborender (VBAP object rendering)");
     mp_add_decoder(list, "eac3", "orender",
+                   "Spatial audio via liborender (VBAP object rendering)");
+    mp_add_decoder(list, "dts", "orender",
                    "Spatial audio via liborender (VBAP object rendering)");
 }
 
