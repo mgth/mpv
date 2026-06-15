@@ -50,7 +50,7 @@ struct ad_orender_params {
     int osc_rx_port;            // incoming control port  (0 = config/default 9000)
     char *osc_bind;             // listener bind address (else config/default)
     char *osc_monitor_target;   // monitoring host (else config/default)
-    int channel_mode_idx;       // non-object render override: 0=auto 1=host 2=direct 3=virtual
+    int channel_mode_idx;       // non-object render override: 0=auto 1=host 2=spatial
 };
 
 const struct m_sub_options ad_orender_conf = {
@@ -62,12 +62,12 @@ const struct m_sub_options ad_orender_conf = {
         {"osc-rx-port", OPT_INT(osc_rx_port), M_RANGE(0, 65535)},
         {"osc-bind", OPT_STRING(osc_bind)},
         {"osc-monitor-target", OPT_STRING(osc_monitor_target)},
-        /* How to render channel-based (non-object) content. Empty = follow the
-         * shared config's render.channel_render_mode. "host" hands the track
-         * back to mpv's native decoder; "direct"/"virtual" render it via
-         * orender. */
+        /* How to render channel-based (non-object) content. "auto" = follow the
+         * shared config's render.channel_render_mode. "host" hands the track back
+         * to mpv's native decoder; "spatial" renders it through orender's virtual
+         * bed. "direct"/"virtual" are legacy aliases of "spatial". */
         {"channel-mode", OPT_CHOICE(channel_mode_idx,
-            {"auto", 0}, {"host", 1}, {"direct", 2}, {"virtual", 3})},
+            {"auto", 0}, {"host", 1}, {"spatial", 2}, {"direct", 2}, {"virtual", 2})},
         {0}
     },
     .size = sizeof(struct ad_orender_params),
@@ -250,7 +250,7 @@ static void ad_orender_process(struct mp_filter *da)
     if (!p->checked_spatial) {
         p->checked_spatial = true;
         bool spatial = orender_is_spatial(p->renderer) == 1;
-        int mode = orender_channel_mode(p->renderer); /* 0 host,1 direct,2 virtual */
+        int mode = orender_channel_mode(p->renderer); /* 0 host, 1 spatial */
         if (!spatial && mode == 0) {
             /* channel-mode=host on a plain multichannel stream: hand the track
              * back to mpv's native decoder (the wrapper polls want_fallback and
@@ -262,8 +262,8 @@ static void ad_orender_process(struct mp_filter *da)
             goto done;
         }
         if (!spatial) {
-            MP_VERBOSE(da, "no spatial objects; rendering channels via "
-                           "channel-mode=%s\n", mode == 1 ? "direct" : "virtual");
+            MP_VERBOSE(da, "no spatial objects; rendering channels through the "
+                           "virtual bed (channel-mode=spatial)\n");
         }
         if (!build_chmap(p)) {
             if (p->chmap.num == 0) {
@@ -357,7 +357,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
 {
     if (!codec->codec ||
         (strcmp(codec->codec, "truehd") != 0 && strcmp(codec->codec, "eac3") != 0 &&
-         strcmp(codec->codec, "dts") != 0))
+         strcmp(codec->codec, "ac3") != 0 && strcmp(codec->codec, "dts") != 0))
         return NULL;
 
     struct mp_filter *da = mp_filter_create(parent, &ad_orender_filter);
@@ -419,14 +419,17 @@ static struct mp_decoder *create(struct mp_filter *parent,
     }
 
     /* Per-invocation override of the shared config's channel render mode.
-     * Option indices: 0=auto (follow config), 1=host, 2=direct, 3=virtual;
-     * the FFI mode codes are 0=host, 1=direct, 2=virtual. */
+     * Option values: 0=auto (follow config), 1=host, 2=spatial (direct/virtual
+     * are legacy aliases of spatial). FFI mode codes: 0=host, 1=spatial — so
+     * `value - 1` maps host(1)→0 and spatial(2)→1. */
     if (opts->channel_mode_idx > 0)
         orender_set_channel_mode(p->renderer, opts->channel_mode_idx - 1);
 
     p->channels = orender_channel_count(p->renderer);
     if (strcmp(codec->codec, "eac3") == 0)
         codec->codec_desc = "eac3 (orender, spatial)";
+    else if (strcmp(codec->codec, "ac3") == 0)
+        codec->codec_desc = "ac3 (orender, spatial)";
     else if (strcmp(codec->codec, "dts") == 0)
         codec->codec_desc = "dts (orender, spatial)";
     else
@@ -440,6 +443,8 @@ static void add_decoders(struct mp_decoder_list *list)
     mp_add_decoder(list, "truehd", "orender",
                    "Spatial audio via liborender (VBAP object rendering)");
     mp_add_decoder(list, "eac3", "orender",
+                   "Spatial audio via liborender (VBAP object rendering)");
+    mp_add_decoder(list, "ac3", "orender",
                    "Spatial audio via liborender (VBAP object rendering)");
     mp_add_decoder(list, "dts", "orender",
                    "Spatial audio via liborender (VBAP object rendering)");
