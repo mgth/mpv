@@ -81,11 +81,6 @@ enum dec_ctrl {
     // int*: extra hw surfaces retained
     VDCTRL_SET_EXTRA_HW_FRAMES,
     VDCTRL_CHECK_FORCED_EOF,
-    // Audio: decoder asks the wrapper to fall back to the native decoder (e.g.
-    // ad_orender on a non-object stream with channel-mode=host, or when the
-    // renderer cannot produce an output layout). Returns CONTROL_TRUE when a
-    // fallback is requested.
-    ADCTRL_CHECK_FALLBACK,
 };
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
