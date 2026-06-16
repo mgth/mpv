@@ -411,13 +411,15 @@ static void ad_orender_process(struct mp_filter *da)
             if (p->renderer)
                 orender_reset(p->renderer);
             p->checked_spatial = false;
+            orender_overlay_set_rendering(1);  // show the spatial overlay again
         } else {
             if (p->native && p->native->f)
                 mp_filter_reset(p->native->f);
-            /* Stop showing the spatial overlay while we decode natively: nothing
-             * is being spatialized, so clear the scene immediately rather than
-             * leaving the last frame to linger until the trails decay. The user's
-             * overlay on/off preference is preserved; spatial mode repopulates it. */
+            /* Hide the whole spatial overlay (wireframe cube included) while we
+             * decode natively — nothing is being spatialized — and drop the stale
+             * scene so it does not linger. The user's overlay on/off preference is
+             * preserved; spatial mode repopulates it. */
+            orender_overlay_set_rendering(0);
             orender_overlay_clear();
         }
         p->active_path = path;
@@ -536,6 +538,12 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     if (p->renderer)
         p->channels = orender_channel_count(p->renderer);
+
+    /* Match the overlay's initial visibility to the starting mode, so it does not
+     * flash the wireframe cube before the first packet picks the path. */
+    bool start_host = p->force_host ||
+                      !p->renderer || orender_channel_mode(p->renderer) != 1;
+    orender_overlay_set_rendering(start_host ? 0 : 1);
 
     if (strcmp(codec->codec, "eac3") == 0)
         codec->codec_desc = "eac3 (orender)";
