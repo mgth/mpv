@@ -2,19 +2,26 @@
  * ad_orender.c — mpv audio decoder that renders spatial audio through liborender.
  *
  * Companion to ad_lavc/ad_spdif: when the user opts in with `--ad=orender` on a
- * supported stream, decode + VBAP-render the spatial objects to N-channel
- * float PCM via liborender (orender_*), instead of letting FFmpeg downmix.
+ * supported stream, decode + VBAP-render the spatial objects to N-channel float
+ * PCM via liborender (orender_*), instead of letting FFmpeg downmix.
  *
- * Modeled on ad_spdif.c (a non-lavc mp_filter decoder). liborender does the
- * decode (via a runtime bridge plugin) and the spatial render; this file only
- * shuttles packets in and aframes out through the filter pin protocol.
+ * Unlike the earlier design, ad_orender does NOT hand the track back to the
+ * decoder wrapper in host mode. It stays selected for the whole track and owns
+ * the orender engine the whole time, so the engine's OSC listener — and thus the
+ * Studio connection — stays alive and keeps receiving the live
+ * `channel_render_mode` switch. Each packet is routed on that live mode:
  *
- * Phase 4: opt-in only (so default playback is untouched). The decoder
- * bridge and speaker layout come from the shared omniphony config YAML
- * (render.bridge_path) — the SAME config the orender CLI + studio use
- * (~/.config/omniphony/config.yaml), resolved by liborender when the config
- * path is NULL. The `--ad-orender-*` options, the is_spatial→ad_lavc fallback,
- * and custom chmaps are Phase 5.
+ *   - spatial : decode + VBAP-render through the engine (objects, or the virtual
+ *               bed for plain channel content);
+ *   - host    : delegate to a native child decoder (ad_lavc → PCM, or ad_spdif →
+ *               bitstream passthrough; chosen by --ad-orender-host-decoder) and
+ *               forward its frames untouched.
+ *
+ * Toggling "Spatialize 2D sources" in Studio flips the engine's mode over OSC,
+ * so the switch is applied live, in both directions, with no mpv restart and no
+ * polling — the engine never leaves, never yields the OSC port to the standby
+ * renderer. The bridge and speaker layout come from the shared omniphony config
+ * YAML (render.bridge_path), resolved by liborender when the config path is NULL.
  */
 
 #include <stdbool.h>
@@ -50,7 +57,8 @@ struct ad_orender_params {
     int osc_rx_port;            // incoming control port  (0 = config/default 9000)
     char *osc_bind;             // listener bind address (else config/default)
     char *osc_monitor_target;   // monitoring host (else config/default)
-    int channel_mode_idx;       // non-object render override: 0=auto 1=host 2=spatial
+    int channel_mode_idx;       // initial render override: 0=auto 1=host 2=spatial
+    int host_decoder_idx;       // host-mode native decoder: 0=lavc 1=spdif
 };
 
 const struct m_sub_options ad_orender_conf = {
@@ -62,12 +70,17 @@ const struct m_sub_options ad_orender_conf = {
         {"osc-rx-port", OPT_INT(osc_rx_port), M_RANGE(0, 65535)},
         {"osc-bind", OPT_STRING(osc_bind)},
         {"osc-monitor-target", OPT_STRING(osc_monitor_target)},
-        /* How to render channel-based (non-object) content. "auto" = follow the
-         * shared config's render.channel_render_mode. "host" hands the track back
-         * to mpv's native decoder; "spatial" renders it through orender's virtual
-         * bed. "direct"/"virtual" are legacy aliases of "spatial". */
+        /* Initial render mode for channel-based (non-object) content. "auto" =
+         * follow the shared config's render.channel_render_mode. "host" decodes
+         * natively (see host-decoder); "spatial" renders through orender's
+         * virtual bed. "direct"/"virtual" are legacy aliases of "spatial". The
+         * live mode is then driven by Studio over OSC. */
         {"channel-mode", OPT_CHOICE(channel_mode_idx,
             {"auto", 0}, {"host", 1}, {"spatial", 2}, {"direct", 2}, {"virtual", 2})},
+        /* Which native decoder to use in host mode: "lavc" decodes to PCM (mpv's
+         * audio chain applies — the default), "spdif" passes the compressed
+         * bitstream through to an AV receiver. */
+        {"host-decoder", OPT_CHOICE(host_decoder_idx, {"lavc", 0}, {"spdif", 1})},
         {0}
     },
     .size = sizeof(struct ad_orender_params),
@@ -80,6 +93,9 @@ const struct m_sub_options ad_orender_conf = {
 
 /* An empty option string means "unset" → pass NULL to the FFI. */
 static const char *nz(const char *s) { return (s && s[0]) ? s : NULL; }
+
+enum { HOST_DEC_LAVC = 0, HOST_DEC_SPDIF = 1 };
+enum { PATH_NONE = -1, PATH_HOST = 0, PATH_SPATIAL = 1 };
 
 /* liborender channel labels — mirror bridge_api::RChannelLabel. cbindgen runs
  * with parse_deps=false, so orender.h does not emit this enum; keep in sync. */
@@ -98,8 +114,11 @@ struct priv {
     int sample_rate;
     int channels;
     struct mp_chmap chmap;
-    bool checked_spatial;
-    bool want_fallback;   // decline → wrapper re-selects the native decoder
+    bool checked_spatial;       // built the output chmap for the spatial path
+    bool force_host;            // engine unusable (no layout / create failed): always native
+    int host_decoder_idx;       // HOST_DEC_LAVC (PCM) or HOST_DEC_SPDIF (passthrough)
+    struct mp_decoder *native;  // lazily-created native child decoder for host mode
+    int active_path;            // PATH_* of the last packet, for clean transitions
     struct mp_decoder public;
 };
 
@@ -155,49 +174,84 @@ static bool build_chmap(struct priv *p)
     return ok;
 }
 
-static void ad_orender_destroy(struct mp_filter *da)
+/* Try each entry in `sel` with `fns->create`, stopping at the first success. */
+static bool try_create_child(struct mp_filter *da, struct priv *p,
+                             const struct mp_decoder_fns *fns,
+                             struct mp_decoder_list *sel)
 {
-    struct priv *p = da->priv;
-    if (p->renderer) {
-        orender_destroy(p->renderer);
-        p->renderer = NULL;
+    for (int i = 0; i < sel->num_entries; i++) {
+        p->native = fns->create(da, p->codec, sel->entries[i].decoder);
+        if (p->native) {
+            MP_VERBOSE(da, "host-mode native decoder: %s\n", sel->entries[i].decoder);
+            return true;
+        }
     }
+    return false;
 }
 
-static void ad_orender_reset(struct mp_filter *da)
+/* Lazily create the native child decoder for host mode, picking the right driver
+ * + decoder for the codec via mpv's normal selection (so e.g. dts → "dca"). With
+ * host-decoder=spdif, request bitstream passthrough for this codec; if that is
+ * not available, fall back to lavc rather than leaving the track undecodable. */
+static bool ensure_native_child(struct mp_filter *da, struct priv *p)
 {
-    struct priv *p = da->priv;
-    if (p->renderer)
-        orender_reset(p->renderer);
-    p->checked_spatial = false;
-}
+    if (p->native)
+        return true;
 
-/* Decoder control: lets the wrapper poll whether we want to be replaced by the
- * native decoder (channel-mode=host on a plain stream, or no output layout). */
-static int ad_orender_control(struct mp_filter *da, enum dec_ctrl cmd, void *arg)
-{
-    struct priv *p = da->priv;
-    switch (cmd) {
-    case ADCTRL_CHECK_FALLBACK:
-        return p->want_fallback ? CONTROL_TRUE : CONTROL_FALSE;
-    default:
-        return CONTROL_UNKNOWN;
+    if (p->host_decoder_idx == HOST_DEC_SPDIF) {
+        /* select_spdif_codec only enables passthrough for codecs listed in its
+         * `pref`; pass this codec so the explicit choice takes effect. */
+        struct mp_decoder_list *sel = select_spdif_codec(p->codec->codec, p->codec->codec);
+        bool ok = try_create_child(da, p, &ad_spdif, sel);
+        talloc_free(sel);
+        if (!ok)
+            MP_WARN(da, "spdif passthrough unavailable for %s; using lavc\n",
+                    p->codec->codec);
     }
+
+    if (!p->native) {
+        struct mp_decoder_list *all = talloc_zero(NULL, struct mp_decoder_list);
+        ad_lavc.add_decoders(all);
+        struct mp_decoder_list *sel = mp_select_decoders(p->log, all, p->codec->codec, NULL);
+        talloc_free(all);
+        try_create_child(da, p, &ad_lavc, sel);
+        talloc_free(sel);
+    }
+
+    if (!p->native) {
+        MP_ERR(da, "could not create a host-mode native decoder for %s\n",
+               p->codec->codec);
+        return false;
+    }
+    return true;
 }
 
-static void ad_orender_process(struct mp_filter *da)
+/* Host mode: pump the native child — forward packets in, decoded frames out. */
+static void process_host(struct mp_filter *da, struct priv *p)
 {
-    struct priv *p = da->priv;
-
-    // Already decided to hand the track back to mpv's native decoder: stop
-    // consuming and emitting. Producing silence frames here would mask the empty
-    // output that the wrapper polls to trigger the fallback (read_frame only
-    // checks ADCTRL_CHECK_FALLBACK when no frame is produced), so the decoder
-    // would otherwise stay selected and play silence. Leaving the packets unread
-    // keeps them available for ad_lavc after the wrapper re-selects it.
-    if (p->want_fallback)
+    if (!ensure_native_child(da, p)) {
+        mp_filter_internal_mark_failed(da);
         return;
+    }
 
+    struct mp_pin *child_in = p->native->f->pins[0];
+    struct mp_pin *child_out = p->native->f->pins[1];
+
+    // Drain decoded frames to our output (and forward EOF transparently).
+    if (mp_pin_can_transfer_data(da->ppins[1], child_out)) {
+        struct mp_frame frame = mp_pin_out_read(child_out);
+        mp_pin_in_write(da->ppins[1], frame);
+    }
+    // Feed input packets to the child.
+    if (mp_pin_can_transfer_data(child_in, da->ppins[0])) {
+        struct mp_frame frame = mp_pin_out_read(da->ppins[0]);
+        mp_pin_in_write(child_in, frame);
+    }
+}
+
+/* Spatial mode: decode + VBAP-render through the engine. */
+static void process_spatial(struct mp_filter *da, struct priv *p)
+{
     if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
         return;
 
@@ -246,43 +300,29 @@ static void ad_orender_process(struct mp_filter *da)
         goto done;
     }
 
-    /* Resolve spatial-vs-plain + the output chmap on the first decoded packet. */
+    if (n_frames == 0)
+        goto done;   /* packet consumed; no output yet (need more data) */
+
+    /* Resolve the output chmap on the first *decoded* frame. Deferred until
+     * n_frames > 0: the layout is only meaningful once the bridge has decoded a
+     * frame (AC-3/DTS need several packets to acquire sync). */
     if (!p->checked_spatial) {
         p->checked_spatial = true;
-        bool spatial = orender_is_spatial(p->renderer) == 1;
-        int mode = orender_channel_mode(p->renderer); /* 0 host, 1 spatial */
-        if (!spatial && mode == 0) {
-            /* channel-mode=host on a plain multichannel stream: hand the track
-             * back to mpv's native decoder (the wrapper polls want_fallback and
-             * re-selects ad_lavc). This is the explicit "let mpv deal with it"
-             * path. */
-            MP_VERBOSE(da, "channel-mode=host on a non-object stream; "
-                           "handing back to the native decoder\n");
-            p->want_fallback = true;
-            goto done;
-        }
-        if (!spatial) {
-            MP_VERBOSE(da, "no spatial objects; rendering channels through the "
-                           "virtual bed (channel-mode=spatial)\n");
-        }
         if (!build_chmap(p)) {
             if (p->chmap.num == 0) {
                 /* The renderer reported no output channels (e.g. the speaker
-                 * layout could not be resolved). Rather than drop every frame —
-                 * which stalls the audio output and freezes playback — hand the
-                 * track back to mpv's native decoder. */
-                MP_WARN(da, "renderer reported no output layout; handing back "
-                            "to the native decoder (check the speaker layout in "
-                            "your omniphony config)\n");
-                p->want_fallback = true;
+                 * layout could not be resolved). Spatial rendering is impossible,
+                 * so route to the native host decoder for the rest of the track
+                 * rather than dropping every frame (which would freeze audio). */
+                MP_WARN(da, "renderer reported no output layout; decoding "
+                            "natively instead (check the speaker layout in your "
+                            "omniphony config)\n");
+                p->force_host = true;
                 goto done;
             }
             MP_WARN(da, "output layout has speakers with no mpv mapping\n");
         }
     }
-
-    if (n_frames == 0)
-        goto done;   /* packet consumed; no output yet (need more data) */
 
     /* Live output-mode switches change the channel count mid-stream: rebuild
      * the chmap so the frame below is allocated for what we actually copy —
@@ -340,6 +380,74 @@ done:
         mp_pin_in_write(da->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
     } else if (failed) {
         mp_filter_internal_mark_failed(da);
+    } else {
+        // No output frame this pass: re-run so the graph stays active. The bridge
+        // needs several packets to acquire sync for some codecs (AC-3/DTS) before
+        // the first decoded frame, so early packets legitimately yield zero
+        // frames; re-running requests the next packet. Without this mpv never
+        // gets a first frame, the audio output is never created, and playback
+        // freezes on the first video frame with no sound. (Also covers the
+        // re-sync after a host→spatial switch, where the bridge was just reset.)
+        mp_filter_internal_mark_progress(da);
+    }
+}
+
+static void ad_orender_process(struct mp_filter *da)
+{
+    struct priv *p = da->priv;
+
+    /* Route on the engine's live channel_render_mode (0 host, 1 spatial), which
+     * Studio flips over OSC. Reading it per packet is a cheap in-memory call, not
+     * a poll. `force_host` (engine unusable) pins host. */
+    int mode = p->renderer ? orender_channel_mode(p->renderer) : 0;
+    bool host = p->force_host || mode != 1;
+    int path = host ? PATH_HOST : PATH_SPATIAL;
+
+    /* On a mode flip, flush stale state on the side we switch *to* so it starts
+     * clean: the engine's bridge re-acquires sync (it wasn't fed during host),
+     * and the native child drops any partial state from a previous host stint. */
+    if (path != p->active_path) {
+        if (path == PATH_SPATIAL) {
+            if (p->renderer)
+                orender_reset(p->renderer);
+            p->checked_spatial = false;
+        } else {
+            if (p->native && p->native->f)
+                mp_filter_reset(p->native->f);
+            /* Stop showing the spatial overlay while we decode natively: nothing
+             * is being spatialized, so clear the scene immediately rather than
+             * leaving the last frame to linger until the trails decay. The user's
+             * overlay on/off preference is preserved; spatial mode repopulates it. */
+            orender_overlay_clear();
+        }
+        p->active_path = path;
+    }
+
+    if (host)
+        process_host(da, p);
+    else
+        process_spatial(da, p);
+}
+
+static void ad_orender_reset(struct mp_filter *da)
+{
+    struct priv *p = da->priv;
+    if (p->renderer)
+        orender_reset(p->renderer);
+    if (p->native && p->native->f)
+        mp_filter_reset(p->native->f);
+    p->checked_spatial = false;
+    p->active_path = PATH_NONE;
+}
+
+static void ad_orender_destroy(struct mp_filter *da)
+{
+    struct priv *p = da->priv;
+    /* The native child is a talloc child of `da` and is freed with it; the
+     * engine is an FFI handle we must release explicitly. */
+    if (p->renderer) {
+        orender_destroy(p->renderer);
+        p->renderer = NULL;
     }
 }
 
@@ -373,11 +481,12 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->log = da->log;
     p->codec = codec;
     p->sample_rate = codec->samplerate;
+    p->active_path = PATH_NONE;
     p->public.f = da;
-    p->public.control = ad_orender_control;
 
     struct ad_orender_params *opts =
         mp_get_config_group(da, da->global, &ad_orender_conf);
+    p->host_decoder_idx = opts->host_decoder_idx;
 
     OrenderConfig cfg = {
         .sample_rate         = p->sample_rate,
@@ -401,39 +510,41 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     p->renderer = orender_create(&cfg);
     if (!p->renderer) {
-        /* liborender resolves the config per-OS (see
-         * renderer/src/config.rs::default_config_path): %ProgramData% on
-         * Windows (machine-wide, shared with the service), $XDG_CONFIG_HOME
-         * (or ~/.config) elsewhere. Match its convention in the hint. */
+        /* The engine could not start (e.g. a bad render.bridge_path). Rather than
+         * leave the track with no decoder at all, stay selected and decode
+         * natively for the whole session (host). Spatial is impossible until the
+         * config is fixed and mpv restarted, but audio still plays. */
 #ifdef _WIN32
-        MP_ERR(da, "orender_create failed — set render.bridge_path in your "
-                   "omniphony config (%%ProgramData%%\\omniphony\\config.yaml); "
-                   "see stderr for the liborender error\n");
+        MP_ERR(da, "orender_create failed — decoding natively. Set "
+                   "render.bridge_path in your omniphony config "
+                   "(%%ProgramData%%\\omniphony\\config.yaml); see stderr.\n");
 #else
-        MP_ERR(da, "orender_create failed — set render.bridge_path in your "
-                   "omniphony config (~/.config/omniphony/config.yaml); see "
-                   "stderr for the liborender error\n");
+        MP_ERR(da, "orender_create failed — decoding natively. Set "
+                   "render.bridge_path in your omniphony config "
+                   "(~/.config/omniphony/config.yaml); see stderr.\n");
 #endif
-        talloc_free(da);
-        return NULL;
+        p->force_host = true;
     }
 
-    /* Per-invocation override of the shared config's channel render mode.
+    /* Per-invocation override of the shared config's initial channel render mode.
      * Option values: 0=auto (follow config), 1=host, 2=spatial (direct/virtual
      * are legacy aliases of spatial). FFI mode codes: 0=host, 1=spatial — so
-     * `value - 1` maps host(1)→0 and spatial(2)→1. */
-    if (opts->channel_mode_idx > 0)
+     * `value - 1` maps host(1)→0 and spatial(2)→1. The live mode is then driven
+     * by Studio over OSC. */
+    if (p->renderer && opts->channel_mode_idx > 0)
         orender_set_channel_mode(p->renderer, opts->channel_mode_idx - 1);
 
-    p->channels = orender_channel_count(p->renderer);
+    if (p->renderer)
+        p->channels = orender_channel_count(p->renderer);
+
     if (strcmp(codec->codec, "eac3") == 0)
-        codec->codec_desc = "eac3 (orender, spatial)";
+        codec->codec_desc = "eac3 (orender)";
     else if (strcmp(codec->codec, "ac3") == 0)
-        codec->codec_desc = "ac3 (orender, spatial)";
+        codec->codec_desc = "ac3 (orender)";
     else if (strcmp(codec->codec, "dts") == 0)
-        codec->codec_desc = "dts (orender, spatial)";
+        codec->codec_desc = "dts (orender)";
     else
-        codec->codec_desc = "truehd (orender, spatial)";
+        codec->codec_desc = "truehd (orender)";
 
     return &p->public;
 }
