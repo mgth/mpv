@@ -192,11 +192,6 @@ struct priv {
 
     int packets_without_output; // number packets sent without frame received
 
-#if HAVE_ORENDER
-    bool orender_active;   // the orender audio decoder is currently selected
-    bool orender_disabled; // force-skip orender on reinit (it declined this track)
-#endif
-
     // Final PTS of previously decoded frame
     double pts;
 
@@ -487,10 +482,13 @@ static bool reinit_decoder(struct priv *p)
         // `--ad=orender`. Unlike ad_spdif this outputs normal float PCM
         // (AF_FORMAT_FLOAT), so the native resampler / audio filter chain still
         // applies. Gated on the explicit decoder name so default playback is
-        // unaffected.
-        if (!p->orender_disabled && driver == &ad_lavc && p->codec->codec &&
+        // unaffected. ad_orender stays selected for the whole track and decodes
+        // host-mode content via an internal native child, so the wrapper never
+        // needs to swap it back out.
+        if (driver == &ad_lavc && p->codec->codec &&
             (strcmp(p->codec->codec, "truehd") == 0 ||
              strcmp(p->codec->codec, "eac3") == 0 ||
+             strcmp(p->codec->codec, "ac3") == 0 ||
              strcmp(p->codec->codec, "dts") == 0) &&
             decoder_list_has(user_list, "orender"))
         {
@@ -504,7 +502,6 @@ static bool reinit_decoder(struct priv *p)
                 talloc_free(ol);
             }
         }
-        p->orender_active = (driver == &ad_orender);
 #endif
     }
 
@@ -1117,25 +1114,6 @@ static void read_frame(struct priv *p)
 
     frame = mp_pin_out_read(p->decoder->f->pins[1]);
     if (!frame.type) {
-#if HAVE_ORENDER
-        // The orender decoder can decline a track after probing the first
-        // packet (channel-mode=host on a plain stream, or no output layout):
-        // re-select the native decoder so playback continues instead of
-        // rendering nothing. The probe packet is dropped; the next packets feed
-        // ad_lavc.
-        if (p->orender_active && p->decoder && p->decoder->control &&
-            p->decoder->control(p->decoder->f, ADCTRL_CHECK_FALLBACK, NULL)
-                == CONTROL_TRUE)
-        {
-            MP_VERBOSE(p, "orender declined the track; falling back to the "
-                          "native audio decoder\n");
-            p->orender_disabled = true;
-            p->orender_active = false;
-            if (!decoder_wrapper_reinit(&p->public))
-                mp_filter_internal_mark_failed(p->decf);
-            mp_filter_internal_mark_progress(p->decf);
-        }
-#endif
         return;
     }
 
