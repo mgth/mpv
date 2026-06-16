@@ -482,10 +482,14 @@ static bool reinit_decoder(struct priv *p)
         // `--ad=orender`. Unlike ad_spdif this outputs normal float PCM
         // (AF_FORMAT_FLOAT), so the native resampler / audio filter chain still
         // applies. Gated on the explicit decoder name so default playback is
-        // unaffected.
+        // unaffected. ad_orender stays selected for the whole track and decodes
+        // host-mode content via an internal native child, so the wrapper never
+        // needs to swap it back out.
         if (driver == &ad_lavc && p->codec->codec &&
             (strcmp(p->codec->codec, "truehd") == 0 ||
-             strcmp(p->codec->codec, "eac3") == 0) &&
+             strcmp(p->codec->codec, "eac3") == 0 ||
+             strcmp(p->codec->codec, "ac3") == 0 ||
+             strcmp(p->codec->codec, "dts") == 0) &&
             decoder_list_has(user_list, "orender"))
         {
             struct mp_decoder_list *ol =
@@ -1109,8 +1113,9 @@ static void read_frame(struct priv *p)
     p->reverse_queue_complete = false;
 
     frame = mp_pin_out_read(p->decoder->f->pins[1]);
-    if (!frame.type)
+    if (!frame.type) {
         return;
+    }
 
     mp_mutex_lock(&p->cache_lock);
     if (p->attached_picture && frame.type == MP_FRAME_VIDEO)
