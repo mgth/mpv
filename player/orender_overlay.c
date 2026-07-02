@@ -26,7 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <orender.h>
+#include "common/orender_abi.h"
+#include "common/orender_dl.h"
 
 #include "common/common.h"
 #include "common/msg.h"
@@ -47,6 +48,7 @@
 struct overlay_ctx {
     struct mp_log *log;
     mpv_handle *client;
+    const struct orender_dl *dl;   // loaded + overlay group verified by start()
 
     bool enabled;
     bool shown;
@@ -107,8 +109,8 @@ static void hide_heatmap(struct overlay_ctx *ctx)
  * Independent of the ASS pull — does not advance trails. */
 static void redraw_heatmap(struct overlay_ctx *ctx, int64_t res_x, int64_t res_y)
 {
-    size_t n = orender_overlay_heatmap_bgra(res_x, res_y, ctx->heatmap_buf,
-                                            HEATMAP_PIX_CAP, ctx->heatmap_geom);
+    size_t n = ctx->dl->overlay_heatmap_bgra(res_x, res_y, ctx->heatmap_buf,
+                                             HEATMAP_PIX_CAP, ctx->heatmap_geom);
     if (n == 0) {
         hide_heatmap(ctx);
         return;
@@ -148,7 +150,7 @@ static void redraw(struct overlay_ctx *ctx)
 
     /* One call == one overlay redraw: the library rebuilds the scene and
      * advances the motion trails on each call, so call exactly once. */
-    size_t n = orender_overlay_ass(res_x, res_y, ctx->buf, ctx->cap);
+    size_t n = ctx->dl->overlay_ass(res_x, res_y, ctx->buf, ctx->cap);
     if (n == 0) {
         /* Nothing to draw (disabled, non-spatial, or empty) → clear both. */
         hide(ctx);
@@ -189,7 +191,7 @@ static void redraw(struct overlay_ctx *ctx)
 static void set_active(struct overlay_ctx *ctx, bool on)
 {
     ctx->enabled = on;
-    orender_overlay_set_enabled(on);
+    ctx->dl->overlay_set_enabled(on);
     if (on) {
         redraw(ctx);
     } else {
@@ -202,7 +204,7 @@ static void set_active(struct overlay_ctx *ctx, bool on)
  * Studio's OSC changes; the renderer is the single source of truth. */
 static void toggle_master(struct overlay_ctx *ctx)
 {
-    ctx->enabled = orender_overlay_toggle() != 0;
+    ctx->enabled = ctx->dl->overlay_toggle() != 0;
     if (ctx->enabled) {
         redraw(ctx);
     } else {
@@ -226,7 +228,7 @@ static void cycle_colormap(struct overlay_ctx *ctx)
 {
     char text[80];
     snprintf(text, sizeof(text), "Heatmap colormap: %" PRIu32,
-             orender_overlay_cycle_heatmap_colormap());
+             ctx->dl->overlay_cycle_heatmap_colormap());
     cmd_show_text(ctx, text);
     redraw(ctx);
 }
@@ -235,7 +237,7 @@ static void adjust_bands(struct overlay_ctx *ctx, int32_t delta)
 {
     char text[80];
     snprintf(text, sizeof(text), "Heatmap planes: %" PRIu32,
-             orender_overlay_adjust_heatmap_bands(delta));
+             ctx->dl->overlay_adjust_heatmap_bands(delta));
     cmd_show_text(ctx, text);
     redraw(ctx);
 }
@@ -252,13 +254,13 @@ static void run_overlay_cmd(struct overlay_ctx *ctx, const char *cmd)
     } else if (!strcmp(cmd, "toggle")) {
         toggle_master(ctx);
     } else if (!strcmp(cmd, "labels")) {
-        bool_toggle(ctx, orender_overlay_toggle_labels, "Overlay labels");
+        bool_toggle(ctx, ctx->dl->overlay_toggle_labels, "Overlay labels");
     } else if (!strcmp(cmd, "objects")) {
-        bool_toggle(ctx, orender_overlay_toggle_objects, "Overlay objects");
+        bool_toggle(ctx, ctx->dl->overlay_toggle_objects, "Overlay objects");
     } else if (!strcmp(cmd, "trails")) {
-        bool_toggle(ctx, orender_overlay_toggle_trails, "Overlay trails");
+        bool_toggle(ctx, ctx->dl->overlay_toggle_trails, "Overlay trails");
     } else if (!strcmp(cmd, "heatmap")) {
-        bool_toggle(ctx, orender_overlay_toggle_heatmap, "Energy heatmap");
+        bool_toggle(ctx, ctx->dl->overlay_toggle_heatmap, "Energy heatmap");
     } else if (!strcmp(cmd, "colormap") || !strcmp(cmd, "heatmap-colormap")) {
         cycle_colormap(ctx);
     } else if (!strcmp(cmd, "bands-inc") || !strcmp(cmd, "heatmap-bands-inc")) {
@@ -352,6 +354,17 @@ static MP_THREAD_VOID overlay_thread(void *p)
 
 void mp_orender_overlay_start(struct MPContext *mpctx)
 {
+    /* The overlay is pure cosmetics: when liborender is absent/incompatible
+     * (the decoder already logs the one actionable warning) or predates the
+     * overlay API, quietly don't start the client thread. */
+    const struct orender_dl *dl = orender_dl_get(mpctx->global, mpctx->log);
+    if (!dl || !dl->have_overlay) {
+        MP_VERBOSE(mpctx, "orender overlay: not starting (%s)\n",
+                   dl ? "library lacks the overlay symbols"
+                      : orender_dl_error());
+        return;
+    }
+
     /* Created before the thread so a destroyed MPContext can't race the
      * client creation (same pattern as scripting.c). */
     mpv_handle *client = mp_new_client(mpctx->clients, "omniphony_overlay");
@@ -364,6 +377,7 @@ void mp_orender_overlay_start(struct MPContext *mpctx)
     struct overlay_ctx *ctx = talloc_zero(NULL, struct overlay_ctx);
     ctx->log = mp_client_get_log(client);
     ctx->client = client;
+    ctx->dl = dl;
     ctx->enabled = true;
     ctx->cap = INITIAL_CAP;
     ctx->buf = malloc(ctx->cap + 1);
