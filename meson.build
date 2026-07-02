@@ -691,11 +691,13 @@ if features['libarchive']
                      'stream/stream_libarchive.c')
 endif
 
-orender = dependency('orender', version: '>= 0.1', required: get_option('orender'))
-features += {'orender': orender.found()}
+# liborender is loaded at runtime (dlopen) against the vendored ABI header
+# common/orender_abi.h — no build-time library or pkg-config dependency. See
+# common/orender_dl.c for the search order and the version handshake.
+features += {'orender': get_option('orender').allowed()}
 if features['orender']
-    dependencies += orender
     sources += files('audio/decode/ad_orender.c',
+                     'common/orender_dl.c',
                      'player/orender_overlay.c')
 endif
 
