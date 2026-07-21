@@ -56,7 +56,10 @@ struct orender_dl {
                            uint8_t *out_labels, uint32_t cap);
 
     /* optional — stubbed when missing */
-    int (*is_spatial)(const struct OrenderRenderer *r);
+    /* Resolved from orender_has_objects (ABI minor >= 6), falling back to
+     * its deprecated alias orender_is_spatial on older engines. Live fact:
+     * may flip mid-stream, never latch it. */
+    int (*has_objects)(const struct OrenderRenderer *r);
     int (*set_option)(struct OrenderRenderer *r, const char *key,
                       const char *value);
     const char *(*build_id)(void);

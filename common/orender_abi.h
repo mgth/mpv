@@ -35,7 +35,7 @@
 // C-ABI minor version: backwards-compatible additions only. Consumers should
 // gate optional features on symbol presence (dlsym), not on this value; it
 // exists for logging and diagnostics.
-#define ORENDER_ABI_MINOR 5
+#define ORENDER_ABI_MINOR 6
 
 // Speaker-position labels written by [`orender_channel_layout`] and
 // [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -122,9 +122,15 @@ struct OrenderRenderer *orender_create(const struct OrenderConfig *cfg);
 // Free a session created by [`orender_create`]. NULL is ignored.
 void orender_destroy(struct OrenderRenderer *r);
 
-// 1 if the current presentation carries spatial objects, 0 if it is a plain
-// multichannel stream (the host should fall back to its standard decoder),
-// <0 on error. Meaningful after at least one [`orender_process`] call.
+// 1 while the current presentation carries dynamic objects, 0 while it is a
+// plain multichannel stream, <0 on error. A live fact: it may flip in either
+// direction mid-stream and must not be latched; before the first decoded
+// frame it reports the bridge's container-level guess. Added in ABI minor 6 —
+// gate on dlsym presence.
+int orender_has_objects(const struct OrenderRenderer *r);
+
+// Deprecated alias of orender_has_objects (pre-minor-6 engines). Same values,
+// same live semantics.
 int orender_is_spatial(const struct OrenderRenderer *r);
 
 // Dynamic object count of the last rendered frame (decoded channels minus the
