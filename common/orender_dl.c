@@ -77,7 +77,7 @@ static void lib_close(void *handle)
 
 /* ── no-op stubs for optional symbols ─────────────────────────────────────── */
 
-static int stub_is_spatial(const struct OrenderRenderer *r) { return -1; }
+static int stub_has_objects(const struct OrenderRenderer *r) { return -1; }
 static int stub_set_option(struct OrenderRenderer *r, const char *key,
                            const char *value) { return -1; }
 static const char *stub_build_id(void) { return NULL; }
@@ -132,7 +132,7 @@ static const struct orender_dl stubs = {
     .object_count = stub_object_count,
     .dialnorm_db = stub_dialnorm_db,
     .bed_layout = stub_layout,
-    .is_spatial = stub_is_spatial,
+    .has_objects = stub_has_objects,
     .set_option = stub_set_option,
     .build_id = stub_build_id,
     .overlay_set_rendering = stub_overlay_set_rendering,
@@ -291,7 +291,9 @@ static bool try_load(struct mp_log *log, const char *path, const char *origin)
      * older engine simply lacks the newer features — never a reason to reject. */
     const struct { const char *name; size_t offset; } optional[] = {
 #define OPT_SYM(field, sym) {sym, offsetof(struct orender_dl, field)}
-        OPT_SYM(is_spatial,            "orender_is_spatial"),
+        /* Alias first so the preferred name overwrites it when both exist. */
+        OPT_SYM(has_objects,           "orender_is_spatial"),
+        OPT_SYM(has_objects,           "orender_has_objects"),
         OPT_SYM(set_option,            "orender_set_option"),
         OPT_SYM(build_id,              "orender_build_id"),
         OPT_SYM(overlay_set_rendering, "orender_overlay_set_rendering"),

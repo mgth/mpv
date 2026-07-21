@@ -496,7 +496,7 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         mpkt = NULL;
     }
 
-    int spatial = p->dl->is_spatial(p->renderer);
+    int spatial = p->dl->has_objects(p->renderer);
     if (spatial == 1) {
         p->source_spatial = true;
         p->source_classified = true;
