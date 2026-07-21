@@ -496,16 +496,25 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         mpkt = NULL;
     }
 
+    /* Classify only from *decoded* frames: before the first frame,
+     * has_objects reports the bridge's container-level guess (e.g. TrueHD
+     * assumes objects until proven otherwise), and latching that guess is
+     * exactly the failure the live-fact contract forbids. */
     int spatial = p->dl->has_objects(p->renderer);
-    if (spatial == 1) {
+    if (spatial == 1 && n_frames > 0) {
         p->source_spatial = true;
         p->source_classified = true;
         clear_probe_packets(p);
         p->dl->overlay_set_rendering(1);
     } else if (probe_host && n_frames > 0) {
         /* The bridge produced a real non-object frame: classification is now
-         * definitive. Discard the probe render and replay from packet zero via
-         * the native child selected for channel-based sources. */
+         * definitive. The decoded fact overrides the provisional container
+         * hint — this presentation is channel-based, not object content — so
+         * clear source_spatial too, else the next packet's routing
+         * (host = !source_spatial && …) would bounce it back to the spatial
+         * path and render HostPassthrough silence. Discard the probe render
+         * and replay from packet zero via the native child. */
+        p->source_spatial = false;
         p->source_classified = true;
         p->active_path = PATH_HOST;
         p->dl->overlay_set_rendering(0);
@@ -731,7 +740,14 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->sample_rate = codec->samplerate;
     p->active_path = PATH_NONE;
     p->source_spatial = codec_is_spatial_hint(codec);
-    p->source_classified = p->source_spatial;
+    /* The hint is provisional: routing follows the *decoded* fact (the
+     * engine's has_objects is live), so classification only happens once the
+     * bridge has produced frames. A container-profiled DTS:X track whose
+     * presentation is fixed channels (no dynamic objects) must still probe
+     * and fall back to the native path in host mode — terminally trusting
+     * the hint here left the embedded engine passing through silence
+     * forever (channel-object contract, phase 5). */
+    p->source_classified = false;
     p->public.f = da;
 
     MP_VERBOSE(da, "input profile: %s (early spatial=%s)\n",
