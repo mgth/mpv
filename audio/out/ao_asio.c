@@ -132,8 +132,12 @@ static void conv_s32(void *dst, const float *src, int n, float vol)
 {
     (void)vol;
     int32_t *d = dst;
+    // 2147483647 is not representable as float: scaling by 2147483647.0f
+    // rounds full scale to 2^31, and lrintf() of that overflows the 32-bit
+    // long, turning +1.0f into INT32_MIN — a full-scale polarity flip on
+    // every clipped peak. Scale in double, where INT32_MAX is exact.
     for (int i = 0; i < n; i++)
-        d[i] = (int32_t)lrintf(clampf(src[i]) * 2147483647.0f);
+        d[i] = (int32_t)lrint(clampf(src[i]) * 2147483647.0);
 }
 
 static void conv_s24(void *dst, const float *src, int n, float vol)
