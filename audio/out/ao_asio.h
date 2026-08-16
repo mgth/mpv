@@ -17,8 +17,21 @@
 
 // Steinberg ASIO host-side interface re-declared in C using the public
 // vtbl ABI (IASIO derives from IUnknown). No Steinberg SDK header is
-// included; this header is a clean-room ABI redeclaration, similar to
-// the approach used by PortAudio's pa_asio.cpp and JACK's ASIO host.
+// included, no SDK source file is compiled, and nothing is downloaded at
+// build time: the declarations below are an independent redeclaration of
+// the interface's binary layout, which is fixed by the ABI.
+//
+// This is deliberate, and not merely a convenience. In October 2025
+// Steinberg dual-licensed the ASIO SDK under GPLv3 alongside their
+// existing proprietary license, so linking it is now possible for an
+// open source project - but doing so would drag ao_asio, and therefore
+// libmpv whenever it is built with ASIO support, to GPLv3. That is
+// incompatible with libmpv's LGPL-2.1+ default and would make
+// -Dgpl=false builds impossible with this AO enabled. Keeping an
+// independent redeclaration under LGPL-2.1+ preserves mpv's licensing
+// across every build configuration it supports. The ASIO ABI has been
+// stable for many years, so there is little maintenance upside to
+// importing the SDK anyway.
 
 #ifndef MP_AO_ASIO_H_
 #define MP_AO_ASIO_H_
@@ -40,7 +53,7 @@
 struct asio_state;
 typedef void (*asio_convert_fn)(void *dst, const float *src, int n, float vol);
 
-// --- ASIO ABI constants (clean-room redeclarations) ---
+// --- ASIO ABI constants ---
 
 typedef long ASIOBool;
 #define ASIOFalse 0L
