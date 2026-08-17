@@ -941,11 +941,30 @@ if features['wasapi']
                      'audio/out/ao_wasapi_utils.c')
 endif
 
-asio = cc.has_header('objbase.h', required:
-    get_option('asio').require(win32))
+# ao_asio includes Steinberg's ASIO SDK headers under the GPLv3 half of the
+# SDK's dual licence, so it is a GPL-only file like ao_jack. Point -Dasio-sdk
+# at the SDK root (the directory holding common/asio.h): only the headers are
+# used, none of the SDK sources are compiled.
+asio_opt = get_option('asio').require(win32).require(
+    get_option('gpl'),
+    error_message: 'the build is not GPL!',
+)
+asio_sdk = get_option('asio-sdk')
+asio = false
+if asio_sdk != ''
+    asio = cc.has_header('objbase.h', required: asio_opt) and \
+           cc.has_header('asio.h', args: ['-I' + asio_sdk / 'common'],
+                         required: asio_opt)
+elif asio_opt.enabled()
+    error('-Dasio=enabled needs -Dasio-sdk=<path to the ASIO SDK>; ' +
+          'get it from https://github.com/audiosdk/asio')
+endif
 features += {'asio': asio}
 if features['asio']
     sources += files('audio/out/ao_asio.c')
+    dependencies += declare_dependency(
+        compile_args: ['-I' + asio_sdk / 'common'],
+    )
     dependencies += cc.find_library('advapi32', required: false)
 endif
 
