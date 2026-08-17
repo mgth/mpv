@@ -52,6 +52,8 @@ at all.
 
 The following files are still GPL only (-Dgpl=false disables them):
 
+    audio/out/ao_asio.c             GPLv3+ (see below)
+    audio/out/ao_asio.h             GPLv3+ (see below)
     audio/out/ao_jack.c             will stay GPL
     audio/out/ao_oss.c              will stay GPL
     stream/dvb*                     must stay GPL
@@ -76,3 +78,12 @@ The following files are still GPL only (-Dgpl=false disables them):
 None of the cases listed above affect the final binary if it's built as
 LGPL. Linked libraries still can affect the final license (for example if
 FFmpeg was built as GPL).
+
+ao_asio is the one GPL-only file that is GPLv3+ rather than GPLv2+: it builds
+against Steinberg's ASIO SDK headers, which Steinberg dual-licensed on
+2025-10-15 under either its proprietary ASIO license or GPLv3. mpv can only
+use the GPLv3 half, so enabling -Dasio makes the resulting binary GPLv3+
+rather than GPLv2+. This is legal because everything else in mpv is "version
+2 or later", but it does narrow what the binary can be combined with, and it
+is why -Dasio requires -Dgpl=true and a -Dasio-sdk path. None of the SDK's own
+sources are compiled: only its headers are used.
