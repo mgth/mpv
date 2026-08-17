@@ -58,7 +58,9 @@ option('pulse', type: 'feature', value: 'auto', description: 'PulseAudio audio o
 option('sdl2-audio', type: 'feature', value: 'disabled', description: 'SDL2 audio output')
 option('sndio', type: 'feature', value: 'auto', description: 'sndio audio output')
 option('wasapi', type: 'feature', value: 'auto', description: 'WASAPI audio output')
-option('asio', type: 'feature', value: 'auto', description: 'Steinberg ASIO audio output (Windows)')
+option('asio', type: 'feature', value: 'auto', description: 'Steinberg ASIO audio output (Windows, GPL only)')
+option('asio-sdk', type: 'string', value: '',
+       description: 'Path to the Steinberg ASIO SDK root, used under its GPLv3 licence (required by -Dasio)')
 
 # video output features
 option('amf', type: 'feature', value: 'auto', description: 'AMD AMF')
