@@ -60,6 +60,13 @@ struct orender_dl {
      * its deprecated alias orender_is_spatial on older engines. Live fact:
      * may flip mid-stream, never latch it. */
     int (*has_objects)(const struct OrenderRenderer *r);
+    /* Constant DSP latency of the rendered output, in samples at the engine
+     * sample rate (ABI minor >= 7; the stub reports 0). Non-zero when the
+     * engine's linear-phase FIR crossover is active. May change mid-stream
+     * (live crossover / output-mode switch) — poll it per rendered frame.
+     * The decoder subtracts latency/sample_rate from output PTS so mpv keeps
+     * A/V sync. */
+    uint64_t (*output_latency_samples)(const struct OrenderRenderer *r);
     int (*set_option)(struct OrenderRenderer *r, const char *key,
                       const char *value);
     const char *(*build_id)(void);
