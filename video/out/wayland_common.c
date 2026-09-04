@@ -3695,6 +3695,12 @@ static void set_color_management(struct vo_wayland_state *wl, struct pl_color_sp
 #if PL_API_VER >= 362
     // scRGB has dedicated creator, and not using the generic one.
     if (color->transfer == PL_COLOR_TRC_SCRGB && wl->supports_scrgb) {
+        // Windows-scRGB is defined with sRGB (BT.709) primaries; wide-gamut
+        // content escapes them through negative/extended values. The hint
+        // still carries the compositor's preferred container primaries
+        // (e.g. BT.2020 on an HDR output), so rendering into those would be
+        // read back as sRGB by the compositor and desaturate the picture.
+        color->primaries = PL_COLOR_PRIM_BT_709;
         image_description = wp_color_manager_v1_create_windows_scrgb(wl->color_manager);
         cm_dispatch_color_queue(wl, image_description);
         return;
