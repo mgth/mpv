@@ -227,7 +227,10 @@ static const char *label_to_short_name(uint8_t lbl)
  * mirrors what ffmpeg reports on the native path so shift+I reads the same.
  * `has_objects` reflects the actually-decoded object presence (object_count > 0),
  * not the bridge's pre-decode "may be spatial" flag — a plain multichannel
- * TrueHD/E-AC3 stream carries no objects and must not be labelled Atmos. */
+ * TrueHD/E-AC3 stream carries no objects and must not be labelled Atmos.
+ * The fallback for engines predating orender_source_label (ABI minor < 9):
+ * it cannot tell a fixed-height DTS:X or an Auro-3D layer from plain DTS,
+ * which is exactly what the engine's own label adds. */
 static const char *profile_base(const char *codec, bool has_objects)
 {
     if (strcmp(codec, "truehd") == 0)
@@ -274,13 +277,23 @@ static void refresh_codec_profile(struct priv *p)
     int objs    = p->dl->object_count(p->renderer);  // >=0 / -1
     int dnorm   = p->dl->dialnorm_db(p->renderer);   // <=0 / INT32_MIN (unknown)
 
+    /* The engine's own name for what it decodes — "DTS-HD MA + DTS:X 7.1.4",
+     * "DTS-HD MA + Auro-3D 11.1", "Dolby TrueHD + Dolby Atmos" (ABI minor
+     * >= 9; older engines report 0 and leave the buffer alone). A name too
+     * long for the buffer is not written either, so it reads as none. */
+    char label[96];
+    label[0] = '\0';
+    p->dl->source_label(p->renderer, label, sizeof(label));
+
     uint8_t bed[MP_NUM_CHANNELS];
     uint32_t bedn = p->dl->bed_layout(p->renderer, bed, MP_NUM_CHANNELS);
-    /* FNV-1a fingerprint of the bed labels, so a bed change (same object count)
-     * still triggers a rebuild. */
+    /* FNV-1a fingerprint of the bed labels and the engine's label, so a bed
+     * or label change (same object count) still triggers a rebuild. */
     unsigned bed_sig = 2166136261u;
     for (uint32_t i = 0; i < bedn; i++)
         bed_sig = (bed_sig ^ bed[i]) * 16777619u;
+    for (const char *c = label; *c; c++)
+        bed_sig = (bed_sig ^ (uint8_t)*c) * 16777619u;
 
     if (objs == p->last_objs && dnorm == p->last_dnorm &&
         bed_sig == p->last_bed_sig)
@@ -297,7 +310,8 @@ static void refresh_codec_profile(struct priv *p)
     char *buf = p->profile_buf[slot];
     size_t cap = sizeof(p->profile_buf[slot]);
 
-    int n = snprintf(buf, cap, "%s", profile_base(p->codec->codec, objs > 0));
+    int n = snprintf(buf, cap, "%s",
+                     label[0] ? label : profile_base(p->codec->codec, objs > 0));
     /* "· <bed labels>+<N> objects", e.g. "· LFE+11 objects" (no bed → "· N
      * objects"). Only when there are objects (plain multichannel reports 0). */
     if (objs > 0 && n > 0 && (size_t)n < cap) {
@@ -623,8 +637,9 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     }
 
     /* Now that a real frame has decoded, the engine knows the presentation's
-     * Atmos flag, object count and DialNorm — surface them as the track's codec
-     * profile so shift+I matches the native path (and adds objects + DialNorm). */
+     * name (or Atmos flag), object count and DialNorm — surface them as the
+     * track's codec profile so shift+I matches the native path (and adds
+     * objects + DialNorm). */
     refresh_codec_profile(p);
 
     /* Compensate the engine's constant DSP latency (ABI minor >= 7; the stub

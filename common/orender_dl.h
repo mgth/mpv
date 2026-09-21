@@ -67,6 +67,14 @@ struct orender_dl {
      * The decoder subtracts latency/sample_rate from output PTS so mpv keeps
      * A/V sync. */
     uint64_t (*output_latency_samples)(const struct OrenderRenderer *r);
+    /* The engine's own name for the presentation's format — "DTS-HD MA +
+     * DTS:X 7.1.4", "DTS-HD MA + Auro-3D 11.1", "Dolby TrueHD + Dolby
+     * Atmos" — NUL-terminated into `out` when `cap` exceeds its length;
+     * returns that length, 0 when the bridge states none (ABI minor >= 9;
+     * the stub reports 0). Follows the channel labels, so poll it with the
+     * other track-info queries. */
+    uint32_t (*source_label)(const struct OrenderRenderer *r, char *out,
+                             uint32_t cap);
     int (*set_option)(struct OrenderRenderer *r, const char *key,
                       const char *value);
     const char *(*build_id)(void);
