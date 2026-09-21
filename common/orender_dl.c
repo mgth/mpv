@@ -82,6 +82,8 @@ static uint64_t stub_output_latency_samples(const struct OrenderRenderer *r)
 {
     return 0;
 }
+static uint32_t stub_source_label(const struct OrenderRenderer *r, char *out,
+                                  uint32_t cap) { return 0; }
 static int stub_set_option(struct OrenderRenderer *r, const char *key,
                            const char *value) { return -1; }
 static const char *stub_build_id(void) { return NULL; }
@@ -138,6 +140,7 @@ static const struct orender_dl stubs = {
     .bed_layout = stub_layout,
     .has_objects = stub_has_objects,
     .output_latency_samples = stub_output_latency_samples,
+    .source_label = stub_source_label,
     .set_option = stub_set_option,
     .build_id = stub_build_id,
     .overlay_set_rendering = stub_overlay_set_rendering,
@@ -300,6 +303,7 @@ static bool try_load(struct mp_log *log, const char *path, const char *origin)
         OPT_SYM(has_objects,           "orender_is_spatial"),
         OPT_SYM(has_objects,           "orender_has_objects"),
         OPT_SYM(output_latency_samples, "orender_output_latency_samples"),
+        OPT_SYM(source_label,          "orender_source_label"),
         OPT_SYM(set_option,            "orender_set_option"),
         OPT_SYM(build_id,              "orender_build_id"),
         OPT_SYM(overlay_set_rendering, "orender_overlay_set_rendering"),
