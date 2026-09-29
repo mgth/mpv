@@ -86,6 +86,16 @@ static uint32_t stub_source_label(const struct OrenderRenderer *r, char *out,
                                   uint32_t cap) { return 0; }
 static int stub_set_option(struct OrenderRenderer *r, const char *key,
                            const char *value) { return -1; }
+static int stub_drain(struct OrenderRenderer *r, float *out,
+                      uintptr_t out_cap_samples, uintptr_t *out_frames,
+                      uint32_t *out_channels, int64_t *out_pts_us)
+{
+    if (out_frames)
+        *out_frames = 0;
+    return 0;
+}
+static int stub_output_packet_pts(const struct OrenderRenderer *r,
+                                  int64_t *pts_us) { return 0; }
 static const char *stub_build_id(void) { return NULL; }
 static void stub_overlay_set_rendering(int rendering) {}
 static void stub_overlay_clear(void) {}
@@ -142,6 +152,8 @@ static const struct orender_dl stubs = {
     .output_latency_samples = stub_output_latency_samples,
     .source_label = stub_source_label,
     .set_option = stub_set_option,
+    .drain = stub_drain,
+    .output_packet_pts = stub_output_packet_pts,
     .build_id = stub_build_id,
     .overlay_set_rendering = stub_overlay_set_rendering,
     .overlay_clear = stub_overlay_clear,
@@ -305,6 +317,8 @@ static bool try_load(struct mp_log *log, const char *path, const char *origin)
         OPT_SYM(output_latency_samples, "orender_output_latency_samples"),
         OPT_SYM(source_label,          "orender_source_label"),
         OPT_SYM(set_option,            "orender_set_option"),
+        OPT_SYM(drain,                 "orender_drain"),
+        OPT_SYM(output_packet_pts,     "orender_output_packet_pts"),
         OPT_SYM(build_id,              "orender_build_id"),
         OPT_SYM(overlay_set_rendering, "orender_overlay_set_rendering"),
         OPT_SYM(overlay_clear,         "orender_overlay_clear"),
@@ -339,6 +353,7 @@ static bool try_load(struct mp_log *log, const char *path, const char *origin)
                      t.overlay_set_enabled != stub_overlay_set_enabled &&
                      t.overlay_toggle != stub_overlay_toggle;
     t.have_set_option = t.set_option != stub_set_option;
+    t.have_output_packet_pts = t.output_packet_pts != stub_output_packet_pts;
     t.path = talloc_strdup(NULL, path);   // process singleton; never freed
 
     table = t;

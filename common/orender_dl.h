@@ -77,6 +77,18 @@ struct orender_dl {
                              uint32_t cap);
     int (*set_option)(struct OrenderRenderer *r, const char *key,
                       const char *value);
+    /* Render what the engine still holds at end of stream, one packet's audio
+     * per call, until it returns 0 frames (ABI minor >= 10; the stub returns
+     * 0 frames). Out-parameters and return as for process. */
+    int (*drain)(struct OrenderRenderer *r, float *out,
+                 uintptr_t out_cap_samples, uintptr_t *out_frames,
+                 uint32_t *out_channels, int64_t *out_pts_us);
+    /* The pts_us passed to process with the packet whose audio the last
+     * process/drain call returned: 1 and *pts_us written, 0 when it returned
+     * none (ABI minor >= 11; the stub returns 0). With the engine's decode
+     * thread on, that audio belongs to an older packet than the one just
+     * passed in. */
+    int (*output_packet_pts)(const struct OrenderRenderer *r, int64_t *pts_us);
     const char *(*build_id)(void);
     void (*overlay_set_rendering)(int rendering);
     void (*overlay_clear)(void);
@@ -98,6 +110,7 @@ struct orender_dl {
     const char *path;               // candidate that won (for logging)
     bool have_overlay;              // full overlay symbol group present
     bool have_set_option;
+    bool have_output_packet_pts;    // the engine carries input timestamps (ABI >= 11)
 };
 
 /* Load liborender once per process (thread-safe; both success and failure are
