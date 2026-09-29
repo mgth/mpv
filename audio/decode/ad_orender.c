@@ -25,6 +25,7 @@
  * YAML (render.bridge_path), resolved by liborender when the config path is NULL.
  */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -119,6 +120,13 @@ struct priv {
      * packet still does not fit at the widest layout, and kept, so a stream
      * with longer packets costs one retry once, not one per packet. */
     int scratch_frames;
+    /* The engine follows the user's decode_thread option (ABI minor >= 11):
+     * a packet's audio may come back a few calls after the packet, stamped
+     * with its own timestamp, and what the engine still holds at end of
+     * stream is drained before the EOF goes on. */
+    bool decode_thread_live;
+    bool draining;              // EOF seen: draining the engine before passing it on
+    struct mp_frame eof_frame;  // the EOF held back while draining
     bool source_spatial;        // container/bridge identified object content
     bool source_classified;     // first decoded presentation has been inspected
     bool force_host;            // engine unusable (no layout / create failed): always native
@@ -464,37 +472,68 @@ static void process_host(struct mp_filter *da, struct priv *p)
     }
 }
 
+/* One call into the engine: the packet when there is one, else a drain call
+ * at end of stream, for what its decode thread still holds. */
+static int engine_call(struct priv *p, struct demux_packet *mpkt, int64_t pts_us,
+                       float *samples, size_t capacity, uintptr_t *n_frames,
+                       uint32_t *n_ch, int64_t *out_pts_us)
+{
+    if (mpkt) {
+        return p->dl->process(p->renderer, mpkt->buffer, mpkt->len, pts_us,
+                              samples, capacity, n_frames, n_ch, out_pts_us);
+    }
+    return p->dl->drain(p->renderer, samples, capacity, n_frames, n_ch,
+                        out_pts_us);
+}
+
 /* Spatial mode: decode + VBAP-render through the engine. */
 static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_host)
 {
-    if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
-        return;
+    struct mp_frame inframe = MP_NO_FRAME;
+    struct demux_packet *mpkt = NULL;
+    if (p->draining) {
+        /* End of stream: hand on what the engine still holds, a packet's
+         * audio per pass, then the EOF held back for it. */
+        if (!mp_pin_in_needs_data(da->ppins[1]))
+            return;
+        probe_host = false;
+    } else {
+        if (!mp_pin_can_transfer_data(da->ppins[1], da->ppins[0]))
+            return;
 
-    struct mp_frame inframe = mp_pin_out_read(da->ppins[0]);
-    if (inframe.type == MP_FRAME_EOF) {
-        if (probe_host && p->num_probe_packets > 0) {
-            MP_TARRAY_APPEND(p, p->probe_packets, p->num_probe_packets, inframe);
-            p->source_classified = true;
-            p->active_path = PATH_HOST;
-            p->dl->overlay_set_rendering(0);
-            p->dl->overlay_clear();
-            process_host(da, p);
-        } else {
-            mp_pin_in_write(da->ppins[1], inframe);
+        inframe = mp_pin_out_read(da->ppins[0]);
+        if (inframe.type == MP_FRAME_EOF) {
+            if (probe_host && p->num_probe_packets > 0) {
+                MP_TARRAY_APPEND(p, p->probe_packets, p->num_probe_packets, inframe);
+                p->source_classified = true;
+                p->active_path = PATH_HOST;
+                p->dl->overlay_set_rendering(0);
+                p->dl->overlay_clear();
+                process_host(da, p);
+            } else if (p->decode_thread_live) {
+                p->draining = true;
+                p->eof_frame = inframe;
+                mp_filter_internal_mark_progress(da);
+            } else {
+                mp_pin_in_write(da->ppins[1], inframe);
+            }
+            return;
+        } else if (inframe.type != MP_FRAME_PACKET) {
+            if (inframe.type) {
+                MP_ERR(da, "unknown frame type\n");
+                mp_filter_internal_mark_failed(da);
+            }
+            return;
         }
-        return;
-    } else if (inframe.type != MP_FRAME_PACKET) {
-        if (inframe.type) {
-            MP_ERR(da, "unknown frame type\n");
-            mp_filter_internal_mark_failed(da);
-        }
-        return;
+        mpkt = inframe.data;
     }
 
-    struct demux_packet *mpkt = inframe.data;
     struct mp_aframe *out = NULL;
     bool failed = false;
-    double pts = mpkt->pts;   /* demuxer timestamp; drives A/V sync (see below) */
+    /* Demuxer timestamp; drives A/V sync (see below). With the engine's decode
+     * thread on, the audio that comes back belongs to an earlier packet, so it
+     * is replaced below by that packet's own timestamp. */
+    double pts = mpkt ? mpkt->pts : MP_NOPTS_VALUE;
 
     /* The output channel count can change mid-stream (Studio toggling the
      * binaural ⇄ speaker output mode), so refresh it every packet and size
@@ -514,11 +553,12 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     uintptr_t n_frames = 0;
     uint32_t n_ch = 0;
     int64_t out_pts_us = 0;
-    int64_t pts_us = mpkt->pts == MP_NOPTS_VALUE ? 0 : (int64_t)(mpkt->pts * 1e6);
+    /* INT64_MIN stands for "no timestamp" on the way through the engine. */
+    int64_t pts_us = !mpkt || mpkt->pts == MP_NOPTS_VALUE
+                     ? INT64_MIN : (int64_t)llrint(mpkt->pts * 1e6);
 
-    int ret = p->dl->process(p->renderer, mpkt->buffer, mpkt->len, pts_us,
-                             samples, capacity,
-                             &n_frames, &n_ch, &out_pts_us);
+    int ret = engine_call(p, mpkt, pts_us, samples, capacity,
+                          &n_frames, &n_ch, &out_pts_us);
     /* A short buffer: the packet is decoded and rendered already, and an engine
      * from ABI 0.10 on (Omniphony #570) holds that audio and hands it back when
      * called again with the same packet, without decoding it a second time.
@@ -545,9 +585,8 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         capacity = (size_t)p->scratch_frames * (size_t)p->scratch_ch_hwm;
         talloc_free(samples);
         samples = talloc_array(NULL, float, capacity);
-        ret = p->dl->process(p->renderer, mpkt->buffer, mpkt->len, pts_us,
-                             samples, capacity,
-                             &n_frames, &n_ch, &out_pts_us);
+        ret = engine_call(p, mpkt, pts_us, samples, capacity,
+                          &n_frames, &n_ch, &out_pts_us);
     }
     if (ret < 0) {
         MP_ERR(da, "orender_process error %d\n", ret);
@@ -559,6 +598,21 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
                     "reports %u ch); dropping packet\n", capacity,
                 p->dl->channel_count(p->renderer));
         goto done;
+    }
+
+    if (!mpkt && n_frames == 0) {
+        /* Drained: nothing is left in the engine, so the EOF can go on. */
+        p->draining = false;
+        mp_pin_in_write(da->ppins[1], p->eof_frame);
+        p->eof_frame = MP_NO_FRAME;
+        talloc_free(samples);
+        return;
+    }
+
+    if (p->dl->have_output_packet_pts) {
+        int64_t in_pts = INT64_MIN;
+        if (p->dl->output_packet_pts(p->renderer, &in_pts) == 1)
+            pts = in_pts == INT64_MIN ? MP_NOPTS_VALUE : in_pts / 1e6;
     }
 
     if (probe_host) {
@@ -744,6 +798,13 @@ static void ad_orender_process(struct mp_filter *da)
 {
     struct priv *p = da->priv;
 
+    /* Past the EOF, only the drain is left: it goes through the spatial path
+     * whatever the live mode says, since only the engine holds that audio. */
+    if (p->draining) {
+        process_spatial(da, p, false);
+        return;
+    }
+
     /* The live channel mode only selects what to do with channel-based sources.
      * Object content identified by the container or bridge always stays on the
      * spatial path, independently of Studio's "Spatialize 2D sources" toggle. */
@@ -796,6 +857,9 @@ static void ad_orender_reset(struct mp_filter *da)
     clear_probe_packets(p);
     p->checked_spatial = false;
     p->active_path = PATH_NONE;
+    /* A seek past the EOF: the engine reset above discarded what was left. */
+    p->draining = false;
+    mp_frame_unref(&p->eof_frame);
 }
 
 static void ad_orender_destroy(struct mp_filter *da)
@@ -910,6 +974,17 @@ static struct mp_decoder *create(struct mp_filter *parent,
                    "(~/.config/omniphony/config.yaml); see stderr.\n");
 #endif
         p->force_host = true;
+    }
+
+    /* Let the user's decode_thread option (Studio, config.yaml) decide whether
+     * the engine decodes on a thread of its own. Only an engine that hands
+     * back each packet's timestamp with its audio (ABI minor >= 11) is asked:
+     * this decoder stamps its output with those and drains at EOF. */
+    if (p->renderer && p->dl->have_output_packet_pts) {
+        p->decode_thread_live =
+            p->dl->set_option(p->renderer, "decode_thread", "live") == 0;
+        MP_VERBOSE(da, "decode thread: %s\n", p->decode_thread_live
+                   ? "follows the decode_thread option" : "not offered");
     }
 
     /* Per-invocation override of the shared config's initial channel render mode.
