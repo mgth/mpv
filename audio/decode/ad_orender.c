@@ -92,6 +92,10 @@ static const char *nz(const char *s) { return (s && s[0]) ? s : NULL; }
 enum { HOST_DEC_LAVC = 0, HOST_DEC_SPDIF = 1 };
 enum { PATH_NONE = -1, PATH_HOST = 0, PATH_SPATIAL = 1 };
 
+/* Output scratch: frames per packet it starts sized for, and how many times a
+ * short one is grown and the packet retried before it is dropped. */
+enum { SCRATCH_FRAMES = 4096, SCRATCH_RETRIES = 4 };
+
 struct priv {
     struct mp_log *log;
     struct mp_codec_params *codec;
@@ -111,6 +115,10 @@ struct priv {
      * frame. That returned "buffer too small" and we dropped the packet —
      * audible as a plop on the switch. */
     int scratch_ch_hwm;
+    /* Frames per packet the scratch holds (0 = SCRATCH_FRAMES). Doubled when a
+     * packet still does not fit at the widest layout, and kept, so a stream
+     * with longer packets costs one retry once, not one per packet. */
+    int scratch_frames;
     bool source_spatial;        // container/bridge identified object content
     bool source_classified;     // first decoded presentation has been inspected
     bool force_host;            // engine unusable (no layout / create failed): always native
@@ -498,7 +506,9 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     /* Never shrink back to the current mode's width — see scratch_ch_hwm. */
     if (ch > p->scratch_ch_hwm)
         p->scratch_ch_hwm = ch;
-    size_t capacity = (size_t)4096 * (size_t)p->scratch_ch_hwm;
+    if (p->scratch_frames <= 0)
+        p->scratch_frames = SCRATCH_FRAMES;
+    size_t capacity = (size_t)p->scratch_frames * (size_t)p->scratch_ch_hwm;
     float *samples = talloc_array(NULL, float, capacity);
 
     uintptr_t n_frames = 0;
@@ -509,22 +519,45 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     int ret = p->dl->process(p->renderer, mpkt->buffer, mpkt->len, pts_us,
                              samples, capacity,
                              &n_frames, &n_ch, &out_pts_us);
+    /* A short buffer: the packet is decoded and rendered already, and an engine
+     * from ABI 0.10 on (Omniphony #570) holds that audio and hands it back when
+     * called again with the same packet, without decoding it a second time.
+     * Grow the scratch and retry: to the width the renderer reports now (an
+     * output-mode switch landing inside the call), else to twice the frames.
+     * Both stay raised, so this costs a retry the first time, not every packet.
+     * Older engines would decode the packet again and advance the bridge
+     * twice, so for them the packet is dropped, as before. */
+    for (int attempt = 0; ret > 0 && attempt < SCRATCH_RETRIES; attempt++) {
+        uint32_t now_ch = p->dl->channel_count(p->renderer);
+        if (p->dl->abi_minor < 10) {
+            if (now_ch > 0 && now_ch <= MP_NUM_CHANNELS && (int)now_ch > p->scratch_ch_hwm)
+                p->scratch_ch_hwm = (int)now_ch;
+            break;
+        }
+        if (now_ch > 0 && now_ch <= MP_NUM_CHANNELS && (int)now_ch > p->scratch_ch_hwm) {
+            p->scratch_ch_hwm = (int)now_ch;
+        } else {
+            p->scratch_frames *= 2;
+        }
+        MP_VERBOSE(da, "orender output buffer too small (%zu floats); retrying "
+                       "with %d frames x %d ch\n", capacity, p->scratch_frames,
+                   p->scratch_ch_hwm);
+        capacity = (size_t)p->scratch_frames * (size_t)p->scratch_ch_hwm;
+        talloc_free(samples);
+        samples = talloc_array(NULL, float, capacity);
+        ret = p->dl->process(p->renderer, mpkt->buffer, mpkt->len, pts_us,
+                             samples, capacity,
+                             &n_frames, &n_ch, &out_pts_us);
+    }
     if (ret < 0) {
         MP_ERR(da, "orender_process error %d\n", ret);
         failed = true;
         goto done;
     }
     if (ret > 0) {
-        /* Retrying is not possible: orender_process has already decoded this
-         * packet by the time it finds the buffer short, so calling again would
-         * advance the bridge twice. Raise the mark to the width the renderer
-         * reports now, so this costs one packet the first time a stream widens
-         * and nothing on later switches. */
-        uint32_t now_ch = p->dl->channel_count(p->renderer);
-        if (now_ch > 0 && now_ch <= MP_NUM_CHANNELS && (int)now_ch > p->scratch_ch_hwm)
-            p->scratch_ch_hwm = (int)now_ch;
-        MP_WARN(da, "orender output buffer too small (sized for %d ch, renderer "
-                    "reports %u ch); dropping packet\n", ch, now_ch);
+        MP_WARN(da, "orender output buffer too small (%zu floats, renderer "
+                    "reports %u ch); dropping packet\n", capacity,
+                p->dl->channel_count(p->renderer));
         goto done;
     }
 
