@@ -234,12 +234,13 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     return true;
 }
 
-// Timed mode: play out the virtual buffer up to now.
+// Timed mode: play out the virtual buffer up to now. It drains whether or
+// not the player counts the AO as playing: what was written has left.
 static void drain(struct ao *ao)
 {
     struct priv *priv = ao->priv;
     double now = mp_time_sec();
-    if (priv->playing && !priv->paused) {
+    if (!priv->paused) {
         priv->buffered -= (now - priv->last_time) * ao->samplerate;
         if (priv->buffered < 0)
             priv->buffered = 0;
@@ -284,17 +285,21 @@ static void start(struct ao *ao)
 {
     struct priv *priv = ao->priv;
     if (priv->timed) {
+        drain(ao);
         priv->paused = false;
         priv->playing = true;
-        priv->last_time = mp_time_sec();
     }
 }
 
 static void reset(struct ao *ao)
 {
     struct priv *priv = ao->priv;
-    // What was written is gone: only the virtual buffer can be dropped.
-    priv->buffered = 0;
+    // What was written cannot be taken back: the reader plays it out. So a
+    // seek keeps the virtual buffer and its clock, the writes after it go on
+    // at the same pace, and the delay accounts for the old audio still ahead
+    // of the new.
+    if (priv->timed)
+        drain(ao);
     priv->paused = false;
     priv->playing = false;
 }
