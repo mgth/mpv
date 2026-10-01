@@ -25,9 +25,12 @@
  * YAML (render.bridge_path), resolved by liborender when the config path is NULL.
  */
 
+#include <inttypes.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
@@ -96,6 +99,29 @@ enum { PATH_NONE = -1, PATH_HOST = 0, PATH_SPATIAL = 1 };
 /* Output scratch: frames per packet it starts sized for, and how many times a
  * short one is grown and the packet retried before it is dropped. */
 enum { SCRATCH_FRAMES = 4096, SCRATCH_RETRIES = 4 };
+
+/* Where the listener is, in demuxer-timestamp microseconds (INT64_MIN: not
+ * playing). Written by the player as it feeds the AO, read by the decoder,
+ * which may run on another thread. Process-wide: there is one AO. */
+static atomic_int_least64_t playing_pts_us = INT64_MIN;
+
+void ad_orender_set_playing_pts(double pts)
+{
+    atomic_store_explicit(&playing_pts_us,
+                          pts == MP_NOPTS_VALUE ? INT64_MIN : llrint(pts * 1e6),
+                          memory_order_relaxed);
+}
+
+/* How a demuxer timestamp maps onto the engine's timeline (*out_pts_us):
+ * from `pts_us` on, engine position = pts + `offset_us`. The two advance
+ * together, so an entry is added only when the offset moves (a seek, a
+ * discontinuity, timestamp drift past HEARD_SLACK_US), and a few cover
+ * everything between the decoder and the speakers. */
+enum { HEARD_MAP_LEN = 16, HEARD_SLACK_US = 2000 };
+struct heard_entry {
+    int64_t pts_us;
+    int64_t offset_us;
+};
 
 struct priv {
     struct mp_log *log;
@@ -166,6 +192,13 @@ struct priv {
     int last_dnorm;
     unsigned last_bed_sig;      // fingerprint of the bed labels (change detection)
     uint64_t last_latency;      // last engine DSP latency, for change logging
+    /* The engine takes where the listener is (ABI 0.12 `heard_us`) and tells
+     * Studio, which then shows each block when it is heard. */
+    bool heard_supported;
+    struct heard_entry heard_map[HEARD_MAP_LEN]; // ring, newest at head - 1
+    int heard_map_head;
+    int heard_map_len;
+    int64_t heard_last_playing_us;  // the playing pts last reported
     struct mp_decoder public;
 };
 
@@ -472,6 +505,59 @@ static void process_host(struct mp_filter *da, struct priv *p)
     }
 }
 
+/* The engine's timeline restarts (orender_reset): nothing mapped still holds. */
+static void heard_map_clear(struct priv *p)
+{
+    p->heard_map_head = 0;
+    p->heard_map_len = 0;
+    p->heard_last_playing_us = INT64_MIN;
+}
+
+/* Audio stamped `pts` (before the DSP latency shift: the content the engine
+ * decoded there) sits at `pos_us` on the engine's timeline. */
+static void heard_map_note(struct priv *p, double pts, int64_t pos_us)
+{
+    if (!p->heard_supported || pts == MP_NOPTS_VALUE)
+        return;
+    int64_t pts_us = llrint(pts * 1e6);
+    int64_t offset_us = pos_us - pts_us;
+    if (p->heard_map_len > 0) {
+        const struct heard_entry *last =
+            &p->heard_map[(p->heard_map_head + HEARD_MAP_LEN - 1) % HEARD_MAP_LEN];
+        if (llabs(offset_us - last->offset_us) <= HEARD_SLACK_US && pts_us >= last->pts_us)
+            return;
+    }
+    p->heard_map[p->heard_map_head] = (struct heard_entry){pts_us, offset_us};
+    p->heard_map_head = (p->heard_map_head + 1) % HEARD_MAP_LEN;
+    if (p->heard_map_len < HEARD_MAP_LEN)
+        p->heard_map_len++;
+}
+
+/* Tell the engine where the listener is on its timeline: the playing pts,
+ * through the newest mapping that starts at or before it. A pts the map does
+ * not reach yet (the old timeline still playing out after a seek) says
+ * nothing. */
+static void report_heard(struct priv *p)
+{
+    if (!p->heard_supported || !p->renderer)
+        return;
+    int64_t playing = atomic_load_explicit(&playing_pts_us, memory_order_relaxed);
+    if (playing == INT64_MIN || playing == p->heard_last_playing_us)
+        return;
+    for (int n = 1; n <= p->heard_map_len; n++) {
+        const struct heard_entry *e =
+            &p->heard_map[(p->heard_map_head + HEARD_MAP_LEN - n) % HEARD_MAP_LEN];
+        if (e->pts_us > playing)
+            continue;
+        int64_t heard = playing + e->offset_us;
+        char value[24];
+        snprintf(value, sizeof(value), "%" PRId64, heard > 0 ? heard : 0);
+        p->dl->set_option(p->renderer, "heard_us", value);
+        p->heard_last_playing_us = playing;
+        return;
+    }
+}
+
 /* One call into the engine: the packet when there is one, else a drain call
  * at end of stream, for what its decode thread still holds. */
 static int engine_call(struct priv *p, struct demux_packet *mpkt, int64_t pts_us,
@@ -556,6 +642,8 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
     /* INT64_MIN stands for "no timestamp" on the way through the engine. */
     int64_t pts_us = !mpkt || mpkt->pts == MP_NOPTS_VALUE
                      ? INT64_MIN : (int64_t)llrint(mpkt->pts * 1e6);
+
+    report_heard(p);
 
     int ret = engine_call(p, mpkt, pts_us, samples, capacity,
                           &n_frames, &n_ch, &out_pts_us);
@@ -743,6 +831,11 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
                    p->sample_rate > 0 ? latency * 1000.0 / p->sample_rate : 0.0);
         p->last_latency = latency;
     }
+    /* Mapped before the shift below: the engine marks a block where it
+     * decoded it, and the listener reaches that block when the content it
+     * decoded there plays, which is this pts. */
+    if (n_frames > 0)
+        heard_map_note(p, pts, out_pts_us);
     if (latency > 0 && p->sample_rate > 0 && pts != MP_NOPTS_VALUE)
         pts -= (double)latency / p->sample_rate;
 
@@ -820,6 +913,7 @@ static void ad_orender_process(struct mp_filter *da)
         if (path == PATH_SPATIAL) {
             if (p->renderer)
                 p->dl->reset(p->renderer);
+            heard_map_clear(p);
             p->checked_spatial = false;
             p->dl->overlay_set_rendering(1);  // show the spatial overlay again
             /* A host stint's child ad_lavc overwrote codec_desc/codec_profile
@@ -852,6 +946,7 @@ static void ad_orender_reset(struct mp_filter *da)
     struct priv *p = da->priv;
     if (p->renderer)
         p->dl->reset(p->renderer);
+    heard_map_clear(p);
     if (p->native && p->native->f)
         mp_filter_reset(p->native->f);
     clear_probe_packets(p);
@@ -985,6 +1080,16 @@ static struct mp_decoder *create(struct mp_filter *parent,
             p->dl->set_option(p->renderer, "decode_thread", "live") == 0;
         MP_VERBOSE(da, "decode thread: %s\n", p->decode_thread_live
                    ? "follows the decode_thread option" : "not offered");
+    }
+
+    /* Tell the engine where the listener is, so Studio can follow the sound
+     * (ABI minor >= 12; an older engine answers -1 for the unknown key). The
+     * first report, 0, is right: nothing has been heard yet. */
+    heard_map_clear(p);
+    if (p->renderer && p->dl->have_set_option) {
+        p->heard_supported = p->dl->set_option(p->renderer, "heard_us", "0") == 0;
+        MP_VERBOSE(da, "heard position: %s\n", p->heard_supported
+                   ? "reported to the engine" : "not offered");
     }
 
     /* Per-invocation override of the shared config's initial channel render mode.

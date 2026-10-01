@@ -22,6 +22,7 @@
 #include <math.h>
 #include <assert.h>
 
+#include "config.h"
 #include "mpv_talloc.h"
 
 #include "common/msg.h"
@@ -39,6 +40,9 @@
 
 #include "core.h"
 #include "command.h"
+#if HAVE_ORENDER
+#include "audio/decode/ad_orender.h"
+#endif
 
 enum {
     AD_OK = 0,
@@ -874,6 +878,12 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
         reload_audio_output(mpctx);
 
     update_throttle(mpctx);
+
+#if HAVE_ORENDER
+    // Where the listener is, for the Omniphony engine to tell Studio.
+    ad_orender_set_playing_pts(mpctx->audio_status == STATUS_PLAYING
+                               ? playing_audio_pts(mpctx) : MP_NOPTS_VALUE);
+#endif
 
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (!ao_c)
