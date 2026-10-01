@@ -466,7 +466,8 @@ static bool reinit_decoder(struct priv *p)
             (strcmp(p->codec->codec, "truehd") == 0 ||
              strcmp(p->codec->codec, "eac3") == 0 ||
              strcmp(p->codec->codec, "ac3") == 0 ||
-             strcmp(p->codec->codec, "dts") == 0) &&
+             strcmp(p->codec->codec, "dts") == 0 ||
+             strcmp(p->codec->codec, "iamf") == 0) &&
             decoder_list_has(user_list, "orender"))
         {
             struct mp_decoder_list *ol =

@@ -126,6 +126,7 @@ typedef struct mkv_track {
 
     double default_duration;
     double codec_delay;
+    double seek_preroll;   // SeekPreRoll, seconds (0 when absent)
 
     int default_track;
     int forced_track;
@@ -980,6 +981,8 @@ static void parse_trackentry(struct demuxer *demuxer,
 
     if (entry->n_codec_delay)
         track->codec_delay = entry->codec_delay / 1e9;
+    if (entry->n_seek_pre_roll)
+        track->seek_preroll = entry->seek_pre_roll / 1e9;
 
     if (entry->n_block_addition_mapping) {
         parse_block_addition_mapping(demuxer, track,
@@ -1882,6 +1885,11 @@ static const char *const mkv_audio_tags[][2] = {
     { "A_TTA1",                 "tta" },
     { "A_MLP",                  "mlp" },
     { "A_ATRAC/AT1",            "atrac1" },
+    // AOMedia IAMF (immersive audio). Proposed mapping, not yet in the
+    // Matroska codec registry: CodecPrivate is the ISO-BMFF
+    // IAConfigurationBox payload, each Block one temporal unit. No lavc
+    // decoder: only --ad=orender plays it.
+    { "A_IAMF",                 "iamf" },
     { NULL },
 };
 
@@ -2137,6 +2145,11 @@ static int demux_mkv_open_audio(demuxer_t *demuxer, mkv_track_t *track)
     sh_a->extradata_size = extradata_len;
 
     sh->seek_preroll = track->codec_delay;
+    // IAMF states its codec pre-roll (80 ms for 20 ms Opus frames) in
+    // SeekPreRoll, which is what a seek must decode ahead of its target;
+    // CodecDelay is only its start trim.
+    if (strcmp(codec, "iamf") == 0 && track->seek_preroll > sh->seek_preroll)
+        sh->seek_preroll = track->seek_preroll;
 
     demux_add_sh_stream(demuxer, sh);
 
