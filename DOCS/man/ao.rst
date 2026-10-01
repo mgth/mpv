@@ -297,6 +297,20 @@ Available audio output drivers are:
         Append to the file, instead of overwriting it. Always use this with the
         ``no-waveheader`` option - with ``waveheader`` it's broken, because
         it will write a WAVE header every time the file is opened.
+    ``--ao-pcm-timed=<yes|no>``
+        Play at the nominal rate on the system clock instead of as fast as the
+        player allows (default: no). The output then behaves as an audio
+        device: mpv paces the audio, and video syncs to it, as it would with a
+        sound card. Use it to feed a renderer reading a pipe that adapts to
+        the writer's clock.
+    ``--ao-pcm-buffer=<seconds>``
+        With ``timed``, the length of the virtual device buffer (default:
+        0.04). mpv writes when a quarter of it has played, so a smaller buffer
+        means smaller, more regular writes.
+    ``--ao-pcm-latency=<seconds>``
+        With ``timed``, the time from writing a sample to hearing it, as the
+        reader on the other end of the pipe holds it (default: 0, meaning the
+        buffer alone). mpv uses it for A/V sync.
 
 ``sndio``
     Audio output to the OpenBSD sndio sound system
