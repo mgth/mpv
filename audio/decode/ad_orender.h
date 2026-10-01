@@ -36,4 +36,12 @@ struct ad_orender_params {
 
 extern const struct m_sub_options ad_orender_conf;
 
+/* What the listener is hearing: the pts of the audio the AO is playing now
+ * (playing_audio_pts()), or MP_NOPTS_VALUE when nothing is. Set by the player
+ * each time it feeds the AO; the decoder turns it into the engine's own
+ * timeline and reports it (orender_set_option "heard_us", ABI 0.12), so
+ * Omniphony Studio can show each block of the scene when it is heard rather
+ * than when it was rendered, a whole audio buffer earlier. Thread-safe. */
+void ad_orender_set_playing_pts(double pts);
+
 #endif
