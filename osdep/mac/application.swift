@@ -102,7 +102,17 @@ class Application: NSApplication, NSApplicationDelegate {
         NSApp.delegate = self
         NSApp.setActivationPolicy(appHub.isBundle ? .regular : .accessory)
         setupBundle()
-        pthread_create(&playbackThreadId, nil, playbackThread, TypeHelper.bridge(obj: self))
+        // The playback thread runs mpv_main, so every decoder init happens on
+        // it. macOS gives a secondary pthread 512 KiB by default, which is
+        // tight for a decoder holding large state. On the other platforms
+        // mpv_main runs on the 8 MiB main thread, so nothing here absorbs it.
+        // Ask for the same 8 MiB so decoder init has comparable room
+        // everywhere.
+        var attr = pthread_attr_t()
+        pthread_attr_init(&attr)
+        pthread_attr_setstacksize(&attr, 8 * 1024 * 1024)
+        pthread_create(&playbackThreadId, &attr, playbackThread, TypeHelper.bridge(obj: self))
+        pthread_attr_destroy(&attr)
         appHub.input.wait()
         NSApp.run()
 
