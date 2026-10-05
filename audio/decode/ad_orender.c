@@ -47,6 +47,7 @@
 #include "filters/f_decoder_wrapper.h"
 #include "filters/filter_internal.h"
 #include "options/m_config.h"
+#include "osdep/timer.h"
 
 #include "audio/decode/ad_orender.h"
 #include "common/orender_abi.h"
@@ -99,6 +100,9 @@ enum { PATH_NONE = -1, PATH_HOST = 0, PATH_SPATIAL = 1 };
 /* Output scratch: frames per packet it starts sized for, and how many times a
  * short one is grown and the packet retried before it is dropped. */
 enum { SCRATCH_FRAMES = 4096, SCRATCH_RETRIES = 4 };
+
+/* The least time between two reports of packets the engine failed on. */
+#define ENGINE_ERROR_INTERVAL_NS MP_TIME_S_TO_NS(1)
 
 /* Where the listener is, in demuxer-timestamp microseconds (INT64_MIN: not
  * playing). Written by the player as it feeds the AO, read by the decoder,
@@ -208,6 +212,12 @@ struct priv {
     int heard_map_head;
     int heard_map_len;
     int64_t heard_last_playing_us;  // the playing pts last reported
+    /* Packets the engine failed on, and so dropped, since the last report;
+     * the last failure's code; and when the next report is due (see
+     * report_engine_errors). */
+    unsigned engine_errors;
+    int engine_error_code;
+    int64_t engine_error_report_ns;
     struct mp_decoder public;
 };
 
@@ -569,6 +579,23 @@ static void report_heard(struct priv *p)
     }
 }
 
+/* Report the packets the engine failed on since the last report. A stretch
+ * of stream it cannot decode fails packet after packet, over a thousand times
+ * a second for the shortest access units, so they are counted and reported
+ * together: the first at once, the rest once per ENGINE_ERROR_INTERVAL_NS
+ * (`flush`: now, whatever the time, because nothing will ask again). */
+static void report_engine_errors(struct mp_filter *da, struct priv *p, bool flush)
+{
+    int64_t now = mp_time_ns();
+    if (now < p->engine_error_report_ns && !flush)
+        return;
+    MP_ERR(da, "orender_process error %d; dropped %u packet%s\n",
+           p->engine_error_code, p->engine_errors,
+           p->engine_errors == 1 ? "" : "s");
+    p->engine_errors = 0;
+    p->engine_error_report_ns = now + ENGINE_ERROR_INTERVAL_NS;
+}
+
 /* One call into the engine: the packet when there is one, else a drain call
  * at end of stream, for what its decode thread still holds. */
 static int engine_call(struct priv *p, struct demux_packet *mpkt, int64_t pts_us,
@@ -610,6 +637,8 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
 
         inframe = mp_pin_out_read(da->ppins[0]);
         if (inframe.type == MP_FRAME_EOF) {
+            if (p->engine_errors)
+                report_engine_errors(da, p, true);
             if (probe_host && p->num_probe_packets > 0) {
                 MP_TARRAY_APPEND(p, p->probe_packets, p->num_probe_packets, inframe);
                 p->source_classified = true;
@@ -697,11 +726,27 @@ static void process_spatial(struct mp_filter *da, struct priv *p, bool probe_hos
         ret = engine_call(p, mpkt, pts_us, samples, capacity,
                           &n_frames, &n_ch, &out_pts_us);
     }
-    if (ret < 0) {
-        MP_ERR(da, "orender_process error %d\n", ret);
-        failed = true;
+    if (ret < 0 && mpkt) {
+        /* The engine could not decode or render the packet (the bridge
+         * rejected it, say). Its audio is lost, the stream is not: drop it and
+         * go on with the next one, as mpv's own decoders do. Ending the pass
+         * as failed would leave nothing asking this filter to run again, and
+         * playback frozen until the next seek. */
+        p->engine_errors++;
+        p->engine_error_code = ret;
+        report_engine_errors(da, p, false);
         goto done;
     }
+    if (ret < 0) {
+        /* A failed drain is not retried: an engine that fails every time
+         * would keep this filter spinning. What it still held, a packet or so
+         * of audio, is given up, and the EOF goes on below. */
+        MP_ERR(da, "orender_drain error %d; dropping what the engine still "
+                   "held\n", ret);
+        n_frames = 0;
+    }
+    if (p->engine_errors)
+        report_engine_errors(da, p, false);
     if (ret > 0) {
         MP_WARN(da, "orender output buffer too small (%zu floats, renderer "
                     "reports %u ch); dropping packet\n", capacity,
@@ -903,7 +948,8 @@ done:
         // frames; re-running requests the next packet. Without this mpv never
         // gets a first frame, the audio output is never created, and playback
         // freezes on the first video frame with no sound. (Also covers the
-        // re-sync after a host→spatial switch, where the bridge was just reset.)
+        // re-sync after a host→spatial switch, where the bridge was just reset,
+        // and a packet dropped because the engine failed on it.)
         mp_filter_internal_mark_progress(da);
     }
 }
@@ -984,6 +1030,8 @@ static void ad_orender_destroy(struct mp_filter *da)
 {
     struct priv *p = da->priv;
     clear_probe_packets(p);
+    if (p->engine_errors)
+        report_engine_errors(da, p, true);
     /* The native child is a talloc child of `da` and is freed with it; the
      * engine is an FFI handle we must release explicitly. The codec profile
      * buffer is a talloc child of p->codec (not of `da`), so it correctly
