@@ -21,8 +21,10 @@
  * Toggling "Spatialize 2D sources" in Studio flips the engine's mode over OSC,
  * so the switch is applied live, in both directions, with no mpv restart and no
  * polling — the engine never leaves, never yields the OSC port to the standby
- * renderer. The bridge and speaker layout come from the shared omniphony config
- * YAML (render.bridge_path), resolved by liborender when the config path is NULL.
+ * renderer. The bridges and speaker layout come from the shared omniphony config
+ * YAML (render.bridge_paths, or a single render.bridge_path), resolved by
+ * liborender when the config path is NULL; with neither, liborender loads every
+ * decoder bridge of the first folder that holds one.
  */
 
 #include <inttypes.h>
@@ -64,6 +66,9 @@ const struct m_sub_options ad_orender_conf = {
          * loader fails hard instead of falling back — see common/orender_dl.c. */
         {"library", OPT_STRING(library_path), .flags = M_OPT_FILE},
         {"config", OPT_STRING(config_path), .flags = M_OPT_FILE},
+        /* One decoder bridge, or several as a path list in the platform's
+         * syntax (':' on Unix, ';' on Windows), in load order. liborender
+         * splits it; empty → render.bridge_paths, then auto-discovery. */
         {"bridge-path", OPT_STRING(bridge_path), .flags = M_OPT_FILE},
         {"osc", OPT_BOOL(osc)},
         {"osc-port", OPT_INT(osc_port), M_RANGE(0, 65535)},
@@ -1163,18 +1168,25 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     p->renderer = p->dl->create(&cfg);
     if (!p->renderer) {
-        /* The engine could not start (e.g. a bad render.bridge_path). Rather than
-         * leave the track with no decoder at all, stay selected and decode
-         * natively for the whole session (host). Spatial is impossible until the
-         * config is fixed and mpv restarted, but audio still plays. */
+        /* The engine could not start (e.g. no decoder bridge loaded from
+         * render.bridge_paths). Rather than leave the track with no decoder at
+         * all, stay selected and decode natively for the whole session (host).
+         * Spatial is impossible until the config is fixed and mpv restarted,
+         * but audio still plays. */
 #ifdef _WIN32
-        MP_ERR(da, "orender_create failed — decoding natively. Set "
-                   "render.bridge_path in your omniphony config "
-                   "(%%ProgramData%%\\omniphony\\config.yaml); see stderr.\n");
+        MP_ERR(da, "orender_create failed — decoding natively; the reason "
+                   "is on stderr. If no decoder bridge loaded, list the bridge "
+                   "libraries in render.bridge_paths in your omniphony config "
+                   "(%%ProgramData%%\\omniphony\\config.yaml) or in --ad-orender-bridge-path "
+                   "(a path list), or leave both unset to load every bridge "
+                   "found next to mpv or in the engine's plugin folders.\n");
 #else
-        MP_ERR(da, "orender_create failed — decoding natively. Set "
-                   "render.bridge_path in your omniphony config "
-                   "(~/.config/omniphony/config.yaml); see stderr.\n");
+        MP_ERR(da, "orender_create failed — decoding natively; the reason "
+                   "is on stderr. If no decoder bridge loaded, list the bridge "
+                   "libraries in render.bridge_paths in your omniphony config "
+                   "(~/.config/omniphony/config.yaml) or in --ad-orender-bridge-path "
+                   "(a path list), or leave both unset to load every bridge "
+                   "found next to mpv or in the engine's plugin folders.\n");
 #endif
         p->force_host = true;
     }
