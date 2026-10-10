@@ -19,12 +19,12 @@
 
 /* All paths/hosts default to empty → passed to liborender as NULL, which then
  * resolves the shared omniphony config (~/.config/omniphony/config.yaml, the
- * same one the CLI + studio use) for the bridge path, speaker layout, and OSC
+ * same one the CLI + studio use) for the bridge paths, speaker layout, and OSC
  * settings. These options only override the config per mpv invocation. */
 struct ad_orender_params {
     char *library_path;         // explicit liborender path (else search order)
     char *config_path;          // override render config YAML (else shared default)
-    char *bridge_path;          // override render.bridge_path
+    char *bridge_path;          // override render.bridge_paths (one path or a path list)
     bool osc;                   // force OSC on (else follows config render.osc)
     int osc_port;               // outgoing/monitoring port (0 = config/default)
     int osc_rx_port;            // incoming control port  (0 = config/default 9000)
