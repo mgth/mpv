@@ -58,7 +58,7 @@ bool af_fmt_is_int(int format)
 
 bool af_fmt_is_spdif(int format)
 {
-    return af_format_sample_alignment(format) > 1;
+    return format >= AF_FORMAT_S_AAC && format <= AF_FORMAT_S_IAMF;
 }
 
 bool af_fmt_is_pcm(int format)
@@ -135,6 +135,7 @@ const char *af_fmt_to_str(int format)
     case AF_FORMAT_S_EAC3:      return "spdif-eac3";
     case AF_FORMAT_S_MP3:       return "spdif-mp3";
     case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
+    case AF_FORMAT_S_IAMF:      return "spdif-iamf";
     }
     return "??";
 }

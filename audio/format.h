@@ -47,6 +47,9 @@ enum af_format {
     AF_FORMAT_S_EAC3,
     AF_FORMAT_S_MP3,
     AF_FORMAT_S_TRUEHD,
+    // IAMF as bursts of a private data type, one temporal unit each: the
+    // burst period is the stream's, not the format's (ad_iamf_iec61937.c).
+    AF_FORMAT_S_IAMF,
 
     AF_FORMAT_COUNT
 };

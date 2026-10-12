@@ -108,6 +108,7 @@ extern const struct mp_decoder_fns ad_lavc;
 extern const struct mp_decoder_fns ad_spdif;
 #if HAVE_ORENDER
 extern const struct mp_decoder_fns ad_orender;
+extern const struct mp_decoder_fns ad_iamf_iec61937;
 #endif
 
 // Convenience wrapper for lavc based decoders. Treat lavc_state as private;

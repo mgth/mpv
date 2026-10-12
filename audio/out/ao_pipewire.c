@@ -602,7 +602,46 @@ static int init(struct ao *ao)
 
     pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", ao->samplerate);
 
-    if (af_fmt_is_spdif(ao->format)) {
+    if (ao->format == AF_FORMAT_S_IAMF) {
+        // IAMF bursts of a private IEC 61937 type: PipeWire has no codec for
+        // them, and the link they are meant for carries PCM. Present the
+        // 16-bit words as that many channels of S16, positionless, and ask
+        // for nothing to be done to them: any mixing, resampling, dither or
+        // volume changes the words. The far end has to match the rate.
+        struct spa_audio_info_raw audio_info = {
+            .format = SPA_AUDIO_FORMAT_S16_LE,
+            .flags = SPA_AUDIO_FLAG_UNPOSITIONED,
+            .rate = ao->samplerate,
+            .channels = ao->channels.num,
+        };
+        for (int i = 0; i < ao->channels.num; i++)
+            audio_info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
+
+        // On a loudspeaker these words are full-scale noise. They go to the
+        // sink the user named and to no other: not the default one, and not
+        // whichever the session manager would move the stream to when that
+        // sink is missing or goes away.
+        if (!ao->device || !ao->device[0]) {
+            MP_ERR(ao, "IAMF bursts need an explicit sink: name the carrier "
+                       "with --audio-device=pipewire/<sink> (they are noise "
+                       "on a loudspeaker, so the default sink is refused)\n");
+            goto error_props;
+        }
+        pw_properties_set(props, "node.dont-fallback", "true");
+        pw_properties_set(props, PW_KEY_NODE_DONT_RECONNECT, "true");
+
+        pw_properties_set(props, PW_KEY_STREAM_DONT_REMIX, "true");
+        pw_properties_set(props, "channelmix.disable", "true");
+        pw_properties_set(props, "resample.disable", "true");
+        pw_properties_set(props, "dither.noise", "0");
+        pw_properties_set(props, "dither.method", "none");
+        // No remembered volume, mute or target for these words.
+        pw_properties_set(props, "state.restore-props", "false");
+
+        params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &audio_info);
+        if (!params[0])
+            goto error_props;
+    } else if (af_fmt_is_spdif(ao->format)) {
         enum spa_audio_iec958_codec spa_codec = af_fmt_to_codec(ao->format);
         if (spa_codec == SPA_AUDIO_IEC958_CODEC_UNKNOWN) {
             MP_ERR(ao, "Unhandled codec %d\n", ao->format);

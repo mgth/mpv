@@ -155,10 +155,14 @@ static int init(struct ao *ao)
         }
     }
 
-    struct mp_chmap_sel sel = {0};
-    mp_chmap_sel_add_waveext(&sel);
-    if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels))
-        return -1;
+    // An IAMF carrier's channels are 16-bit words of a bitstream, not
+    // speakers: they keep their count and have no layout to adjust to.
+    if (ao->format != AF_FORMAT_S_IAMF) {
+        struct mp_chmap_sel sel = {0};
+        mp_chmap_sel_add_waveext(&sel);
+        if (!ao_chmap_sel_adjust(ao, &sel, &ao->channels))
+            return -1;
+    }
 
     ao->bps = ao->channels.num * (int64_t)ao->samplerate * af_fmt_to_bytes(ao->format);
 
