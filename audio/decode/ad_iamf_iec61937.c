@@ -33,6 +33,7 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -408,6 +409,21 @@ static struct mp_decoder *create(struct mp_filter *parent,
     struct ad_iamf_iec61937_params *opts =
         mp_get_config_group(da, da->global, &ad_iamf_iec61937_conf);
 
+    /* The frame pool sizes a period in int arithmetic, the samples aligned
+     * to 32 and the bytes to 64, and process() takes frames x stride as the
+     * burst's length: bound the count and the products before anything is
+     * sized by them, or a stated count past INT_MAX turns negative. */
+    int sstride = opts->channels * 2;
+    uint64_t aligned = MP_ALIGN_UP((uint64_t)unit_samples, 32);
+    if (unit_samples > (uint32_t)(INT_MAX - 32) ||
+        MP_ALIGN_UP(aligned * (uint64_t)sstride, 64) > (uint64_t)INT_MAX)
+    {
+        MP_ERR(da, "IAMF units of %" PRIu32 " samples do not fit a carrier "
+                   "period on %d channels\n", unit_samples, opts->channels);
+        talloc_free(da);
+        return NULL;
+    }
+
     p->descriptors_len = desc_len;
     p->descriptors = talloc_memdup(p, (void *)desc, desc_len);
     p->redundant = talloc_memdup(p, (void *)desc, desc_len);
@@ -425,7 +441,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     struct mp_chmap chmap;
     mp_chmap_set_unknown(&chmap, opts->channels);
-    p->sstride = opts->channels * 2;
+    p->sstride = sstride;
     p->period_frames = unit_samples;
     p->restart_pending = true;
     if (opts->copy_interval_ms) {
@@ -441,10 +457,10 @@ static struct mp_decoder *create(struct mp_filter *parent,
     mp_aframe_set_rate(p->fmt, rate);
 
     MP_INFO(da, "IAMF as IEC 61937 bursts: %u-sample units on %d ch at %d Hz "
-                "(%d-byte period, %d kbit/s), descriptors (%zu bytes) every "
-                "%d unit(s)\n",
+                "(%d-byte period, %" PRId64 " kbit/s), descriptors (%zu bytes) "
+                "every %d unit(s)\n",
             unit_samples, opts->channels, rate, p->period_frames * p->sstride,
-            p->sstride * rate / 125, desc_len, p->copy_every);
+            (int64_t)p->sstride * rate / 125, desc_len, p->copy_every);
 
     return &p->public;
 }
