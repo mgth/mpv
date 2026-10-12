@@ -75,6 +75,9 @@ enum dec_ctrl {
     // framedrop mode: 0=none, 1=standard, 2=hrseek
     VDCTRL_SET_FRAMEDROP,
     VDCTRL_CHECK_FORCED_EOF,
+    // struct mp_aframe*: this frame of the decoder's is about to be handed
+    // to the audio output (ad_iamf_iec61937.c)
+    ADCTRL_IAMF_BURST_SENT,
 };
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
