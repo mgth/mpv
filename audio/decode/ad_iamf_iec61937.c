@@ -25,6 +25,7 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -89,11 +90,16 @@ struct priv {
     uint8_t *redundant;
     size_t descriptors_len;
 
+    int rate;               // carrier frames a second
     int sstride;            // bytes per carrier frame
     int period_frames;      // carrier frames one unit lasts
     int copy_every;         // units between redundant copies, 0: none
     int since_copy;         // units since the descriptors last went out
     bool restart;           // the next burst opens the sequence
+    /* After a seek the player drops the frames that end before its target
+     * — whole, since an IEC 61937 frame is never cut — so a burst that ends
+     * before it never reaches the receiver. MP_NOPTS_VALUE: none dropped. */
+    double start_pts;
     uint64_t too_long;      // units that did not fit their period
     struct mp_decoder public;
 };
@@ -247,8 +253,17 @@ static void process(struct mp_filter *da)
             memcpy(burst + BURST_HEADER_BYTES, lead, lead_len);
         memcpy(burst + BURST_HEADER_BYTES + lead_len, mpkt->buffer, mpkt->len);
         if (lead) {
-            p->since_copy = 0;
-            p->restart = false;
+            /* The descriptors that open the sequence count only once a
+             * burst carrying them reaches the output: one the player drops
+             * after a seek would leave the receiver without them, so the
+             * next burst carries them again. */
+            bool reaches = p->start_pts == MP_NOPTS_VALUE ||
+                           mpkt->pts == MP_NOPTS_VALUE ||
+                           mpkt->pts + (double)p->period_frames / p->rate > p->start_pts;
+            if (reaches) {
+                p->since_copy = 0;
+                p->restart = false;
+            }
         }
     }
     p->since_copy++;
@@ -268,6 +283,16 @@ static void reset(struct mp_filter *da)
 {
     struct priv *p = da->priv;
     p->restart = true;
+}
+
+static int control(struct mp_filter *da, enum dec_ctrl cmd, void *arg)
+{
+    struct priv *p = da->priv;
+    if (cmd == VDCTRL_SET_START_PTS) {
+        p->start_pts = *(double *)arg;
+        return CONTROL_OK;
+    }
+    return CONTROL_UNKNOWN;
 }
 
 static const struct mp_filter_info ad_iamf_iec61937_filter = {
@@ -326,9 +351,26 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->codec = codec;
     p->pool = mp_aframe_pool_create(p);
     p->public.f = da;
+    p->public.control = control;
+    p->start_pts = MP_NOPTS_VALUE;
 
     struct ad_iamf_iec61937_params *opts =
         mp_get_config_group(da, da->global, &ad_iamf_iec61937_conf);
+
+    /* The frame pool sizes a period in int arithmetic — the samples aligned
+     * to 32, the bytes to 64 — and process() takes frames x stride as the
+     * burst's length: bound the count and the products before anything is
+     * sized by them, or a stated count past INT_MAX turns negative. */
+    int sstride = opts->channels * 2;
+    uint64_t aligned = MP_ALIGN_UP((uint64_t)unit_samples, 32);
+    if (unit_samples > (uint32_t)(INT_MAX - 32) ||
+        MP_ALIGN_UP(aligned * (uint64_t)sstride, 64) > (uint64_t)INT_MAX)
+    {
+        MP_ERR(da, "IAMF units of %" PRIu32 " samples do not fit a carrier "
+                   "period on %d channels\n", unit_samples, opts->channels);
+        talloc_free(da);
+        return NULL;
+    }
 
     p->descriptors_len = desc_len;
     p->descriptors = talloc_memdup(p, (void *)desc, desc_len);
@@ -347,7 +389,8 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     struct mp_chmap chmap;
     mp_chmap_set_unknown(&chmap, opts->channels);
-    p->sstride = opts->channels * 2;
+    p->rate = rate;
+    p->sstride = sstride;
     p->period_frames = unit_samples;
     p->restart = true;
     if (opts->copy_interval_ms) {

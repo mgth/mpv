@@ -994,6 +994,7 @@ static void feed_packet(struct priv *p)
             framedrop_type = 2;
 
         p->decoder->control(p->decoder->f, VDCTRL_SET_FRAMEDROP, &framedrop_type);
+        p->decoder->control(p->decoder->f, VDCTRL_SET_START_PTS, &start_pts);
     }
 
     if (!p->dec_dispatch && p->public.recorder_sink)

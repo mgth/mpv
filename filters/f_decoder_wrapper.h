@@ -75,6 +75,10 @@ enum dec_ctrl {
     // framedrop mode: 0=none, 1=standard, 2=hrseek
     VDCTRL_SET_FRAMEDROP,
     VDCTRL_CHECK_FORCED_EOF,
+    // The time the output drops frames before after a seek (double *),
+    // MP_NOPTS_VALUE when none: a decoder whose frames carry state the
+    // receiver must not miss can tell which frame reaches the output.
+    VDCTRL_SET_START_PTS,
 };
 
 int mp_decoder_wrapper_control(struct mp_decoder_wrapper *d,
