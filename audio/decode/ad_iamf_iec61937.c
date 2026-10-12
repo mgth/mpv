@@ -23,6 +23,12 @@
  * becomes the descriptors as they are. The marker is this decoder's own, so
  * several players in one process do not share it.
  *
+ * That report goes through the track's own decoder wrapper, so the carrier
+ * needs a track that feeds the audio output directly. Behind --lavfi-complex
+ * no burst is reported: every burst then leads with the copy, a receiver
+ * without the sequence still opens on it, but none restarts its decoder
+ * after a seek.
+ *
  * The frames are flagged as a compressed format (AF_FORMAT_S_IAMF), so no
  * filter, volume or resampler touches the words. The carrier is
  * --ad-iamf-iec61937-channels wide at the track's own rate; a unit longer
@@ -94,9 +100,9 @@ struct priv {
     struct mp_aframe *fmt;
     struct mp_aframe_pool *pool;
 
-    /* The sequence's descriptor OBUs, as CodecPrivate has them, and the
-     * same with obu_redundant_copy set on each. */
-    uint8_t *descriptors;
+    /* The sequence's descriptor OBUs, as CodecPrivate has them but with
+     * obu_redundant_copy set on each: what a burst leads with. The player's
+     * report clears the flags in the one burst that opens the sequence. */
     uint8_t *redundant;
     size_t descriptors_len;
 
@@ -307,7 +313,10 @@ bool ad_iamf_iec61937_leads_with_copy(struct mp_aframe *frame)
     size_t payload;
     size_t len = (size_t)mp_aframe_get_size(frame) * mp_aframe_get_sstride(frame);
     uint8_t *obus = burst_payload(data[0], len, &payload);
-    return obus && obus[0] == (OBU_SEQUENCE_HEADER << 3 | OBU_REDUNDANT_COPY);
+    /* By type and flag, whatever else the header carries (an extension
+     * flag stays in the copy). */
+    return obus && obus[0] >> 3 == OBU_SEQUENCE_HEADER &&
+           (obus[0] & OBU_REDUNDANT_COPY);
 }
 
 /* The player is about to hand a burst of this decoder's to the audio output,
@@ -425,7 +434,6 @@ static struct mp_decoder *create(struct mp_filter *parent,
     }
 
     p->descriptors_len = desc_len;
-    p->descriptors = talloc_memdup(p, (void *)desc, desc_len);
     p->redundant = talloc_memdup(p, (void *)desc, desc_len);
     for (size_t pos = 0; pos < desc_len;) {
         size_t body;
