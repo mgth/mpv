@@ -41,6 +41,7 @@
 #include "core.h"
 #include "command.h"
 #if HAVE_ORENDER
+#include "audio/decode/ad_iamf_iec61937.h"
 #include "audio/decode/ad_orender.h"
 #endif
 
@@ -752,6 +753,11 @@ static void ao_process(struct mp_filter *f)
             MP_VERBOSE(mpctx, "previous audio still playing; continuing\n");
         }
 
+#if HAVE_ORENDER
+        // Past every drop: the first IAMF burst sent after a (re)start is
+        // the one that opens the sequence at the receiver.
+        ad_iamf_iec61937_frame_sent(af);
+#endif
         mp_pin_in_write(ao_c->queue_filter->pins[0], frame);
     } else if (frame.type == MP_FRAME_EOF) {
         MP_VERBOSE(mpctx, "audio filter EOF\n");

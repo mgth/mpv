@@ -15,6 +15,12 @@
  * are when the stream (re)starts, which opens a new sequence at the receiver,
  * and as a redundant copy every so often, for a receiver that joins late.
  *
+ * Which burst is the first the receiver gets after a (re)start is not known
+ * here: the player drops whole frames before its sync point (seek preroll,
+ * audio ahead of the video). So while a restart is pending every burst leads
+ * with the copy, and the player turns the copy of the first burst it does
+ * send into the descriptors as they are (ad_iamf_iec61937_frame_sent()).
+ *
  * The frames are flagged as a compressed format (AF_FORMAT_S_IAMF), so no
  * filter, volume or resampler touches the words. The carrier is
  * --ad-iamf-iec61937-channels wide at the track's own rate; a unit longer
@@ -25,6 +31,7 @@
  */
 
 #include <inttypes.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -74,8 +81,15 @@ const struct m_sub_options ad_iamf_iec61937_conf = {
 #define MAX_PAYLOAD_BYTES ((1 << 21) - 1)
 
 #define OBU_CODEC_CONFIG 0
+#define OBU_MIX_PRESENTATION 2
+#define OBU_SEQUENCE_HEADER 31
 #define OBU_REDUNDANT_COPY 0x04
 #define OBU_EXTENSION 0x01
+
+/* The stream (re)started and no burst has reached the audio output since:
+ * set by the decoder, cleared by the player on the first burst it sends.
+ * Process-wide, as there is one audio output. */
+static atomic_bool restart_pending;
 
 struct priv {
     struct mp_log *log;
@@ -93,7 +107,6 @@ struct priv {
     int period_frames;      // carrier frames one unit lasts
     int copy_every;         // units between redundant copies, 0: none
     int since_copy;         // units since the descriptors last went out
-    bool restart;           // the next burst opens the sequence
     uint64_t too_long;      // units that did not fit their period
     struct mp_decoder public;
 };
@@ -215,15 +228,13 @@ static void process(struct mp_filter *da)
     size_t period = (size_t)p->period_frames * p->sstride;
     memset(burst, 0, period);
 
-    /* The descriptors as they are open a new sequence at the receiver: at
-     * the start, and after a seek, where its decoder starts afresh. A copy
-     * is skipped by a receiver that has the sequence. */
+    /* A copy of the descriptors is skipped by a receiver that has the
+     * sequence. While a restart is pending every burst leads with one: the
+     * player makes the first it sends the descriptors as they are. */
     const uint8_t *lead = NULL;
-    if (p->restart) {
-        lead = p->descriptors;
-    } else if (p->copy_every && p->since_copy >= p->copy_every) {
+    if (atomic_load_explicit(&restart_pending, memory_order_relaxed) ||
+        (p->copy_every && p->since_copy >= p->copy_every))
         lead = p->redundant;
-    }
     size_t lead_len = lead ? p->descriptors_len : 0;
     size_t payload = lead_len + mpkt->len;
 
@@ -246,10 +257,8 @@ static void process(struct mp_filter *da)
         if (lead)
             memcpy(burst + BURST_HEADER_BYTES, lead, lead_len);
         memcpy(burst + BURST_HEADER_BYTES + lead_len, mpkt->buffer, mpkt->len);
-        if (lead) {
+        if (lead)
             p->since_copy = 0;
-            p->restart = false;
-        }
     }
     p->since_copy++;
     mp_aframe_set_pts(out, mpkt->pts);
@@ -267,7 +276,45 @@ done:
 static void reset(struct mp_filter *da)
 {
     struct priv *p = da->priv;
-    p->restart = true;
+    p->since_copy = 0;
+    atomic_store_explicit(&restart_pending, true, memory_order_relaxed);
+}
+
+/* The player is about to hand `frame` to the audio output. If the stream
+ * (re)started and this is the first burst to get there, its copy of the
+ * descriptors becomes the descriptors as they are: the receiver opens a new
+ * sequence on it, where its decoder starts afresh. */
+void ad_iamf_iec61937_frame_sent(struct mp_aframe *frame)
+{
+    if (mp_aframe_get_format(frame) != AF_FORMAT_S_IAMF ||
+        !atomic_load_explicit(&restart_pending, memory_order_relaxed))
+        return;
+    uint8_t **data = mp_aframe_get_data_rw(frame);
+    if (!data)
+        return;
+    uint8_t *burst = data[0];
+    size_t len = (size_t)mp_aframe_get_size(frame) * mp_aframe_get_sstride(frame);
+    /* An empty period (a unit that did not fit) restarts nothing. */
+    if (len < BURST_HEADER_BYTES || burst[0] != (SYNCWORD_PA & 0xFF) ||
+        burst[1] != SYNCWORD_PA >> 8 || burst[4] != DATA_TYPE_IAMF_PRIVATE)
+        return;
+    size_t payload = (size_t)(burst[5] & 0x1F) << 16 | burst[7] << 8 | burst[6];
+    if (payload > len - BURST_HEADER_BYTES)
+        return;
+    uint8_t *obus = burst + BURST_HEADER_BYTES;
+    bool opened = false;
+    for (size_t pos = 0; pos < payload;) {
+        size_t body;
+        size_t obu = obu_len(obus + pos, payload - pos, &body);
+        int type = obus[pos] >> 3;
+        if (!obu || (type != OBU_SEQUENCE_HEADER && type > OBU_MIX_PRESENTATION))
+            break;
+        obus[pos] &= ~OBU_REDUNDANT_COPY;
+        opened = true;
+        pos += obu;
+    }
+    if (opened)
+        atomic_store_explicit(&restart_pending, false, memory_order_relaxed);
 }
 
 static const struct mp_filter_info ad_iamf_iec61937_filter = {
@@ -349,7 +396,7 @@ static struct mp_decoder *create(struct mp_filter *parent,
     mp_chmap_set_unknown(&chmap, opts->channels);
     p->sstride = opts->channels * 2;
     p->period_frames = unit_samples;
-    p->restart = true;
+    atomic_store_explicit(&restart_pending, true, memory_order_relaxed);
     if (opts->copy_interval_ms) {
         int64_t units = ((int64_t)opts->copy_interval_ms * rate + 500LL * unit_samples) /
                         (1000LL * unit_samples);
