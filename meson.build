@@ -677,7 +677,8 @@ endif
 # common/orender_dl.c for the search order and the version handshake.
 features += {'orender': get_option('orender').allowed()}
 if features['orender']
-    sources += files('audio/decode/ad_orender.c',
+    sources += files('audio/decode/ad_iamf_iec61937.c',
+                     'audio/decode/ad_orender.c',
                      'common/orender_dl.c',
                      'player/orender_overlay.c')
 endif

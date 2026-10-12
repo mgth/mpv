@@ -383,6 +383,7 @@ typedef struct MPOpts {
     // Always present (incomplete type when orender is disabled); only the
     // ad-orender sub-option registration in options.c is HAVE_ORENDER-gated.
     struct ad_orender_params *ad_orender_params;
+    struct ad_iamf_iec61937_params *ad_iamf_iec61937_params;
 
     struct hwdec_opts *hwdec_opts;
 

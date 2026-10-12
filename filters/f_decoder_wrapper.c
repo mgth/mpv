@@ -480,6 +480,20 @@ static bool reinit_decoder(struct priv *p)
                 talloc_free(ol);
             }
         }
+
+        // `--ad=iamf-iec61937`: carry an IAMF track as bursts of a private
+        // IEC 61937 data type instead of decoding it, for an Omniphony
+        // renderer down a PCM link. Explicit only, like orender.
+        if (driver == &ad_lavc && p->codec->codec &&
+            strcmp(p->codec->codec, "iamf") == 0 &&
+            decoder_list_has(user_list, "iamf-iec61937"))
+        {
+            struct mp_decoder_list *il =
+                talloc_zero(NULL, struct mp_decoder_list);
+            ad_iamf_iec61937.add_decoders(il);
+            driver = &ad_iamf_iec61937;
+            list = il;
+        }
 #endif
     }
 
