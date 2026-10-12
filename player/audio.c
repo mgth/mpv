@@ -755,8 +755,16 @@ static void ao_process(struct mp_filter *f)
 
 #if HAVE_ORENDER
         // Past every drop: the first IAMF burst sent after a (re)start is
-        // the one that opens the sequence at the receiver.
-        ad_iamf_iec61937_frame_sent(af);
+        // the one that opens the sequence at the receiver. Its decoder
+        // knows whether one is pending; only bursts that lead with a copy
+        // of the descriptors are worth asking about (a few after a restart,
+        // then one per copy interval).
+        if (ao_c->track && ao_c->track->dec &&
+            ad_iamf_iec61937_leads_with_copy(af))
+        {
+            mp_decoder_wrapper_control(ao_c->track->dec,
+                                       ADCTRL_IAMF_BURST_SENT, af);
+        }
 #endif
         mp_pin_in_write(ao_c->queue_filter->pins[0], frame);
     } else if (frame.type == MP_FRAME_EOF) {
