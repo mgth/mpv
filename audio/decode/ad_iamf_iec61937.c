@@ -13,7 +13,8 @@
  * is the stream's time and mpv's A/V sync works as with any output. The
  * payload is the unit's OBUs, preceded by the sequence's descriptors: as they
  * are when the stream (re)starts, which opens a new sequence at the receiver,
- * and as a redundant copy every so often, for a receiver that joins late.
+ * and as a redundant copy with the units of the next LEAD_COPIES_MS and then
+ * every so often, for a receiver that missed the opening burst or joins late.
  *
  * Which burst is the first the receiver gets after a (re)start is not known
  * here: the player drops whole frames before its sync point (seek preroll,
@@ -22,6 +23,13 @@
  * the first of them it does send (ADCTRL_IAMF_BURST_SENT): that one's copy
  * becomes the descriptors as they are. The marker is this decoder's own, so
  * several players in one process do not share it.
+ *
+ * The opening burst is the one a link loses most easily: an output that is
+ * still starting drops the first tens of milliseconds it is given (seen on a
+ * PipeWire sink about one start in three). The units that follow it lead
+ * with a copy for that reason, whatever the copy interval is, so a receiver
+ * that lost it starts on the next burst it gets rather than an interval
+ * later. One that has the sequence skips them.
  *
  * That report goes through the track's own decoder wrapper, so the carrier
  * needs a track that feeds the audio output directly. Behind --lavfi-complex
@@ -35,7 +43,8 @@
  * than its period needs a wider one.
  *
  * The same stream is written by `orender wrap-iec61937` from a standalone
- * IAMF file (Omniphony's spdif crate), byte for byte.
+ * IAMF file (Omniphony's spdif crate): byte for byte but for the copies that
+ * follow an opening burst, which it does not write.
  */
 
 #include <inttypes.h>
@@ -67,7 +76,8 @@ const struct m_sub_options ad_iamf_iec61937_conf = {
         /* Carrier width: its byte rate is channels x rate x 2. */
         {"channels", OPT_INT(channels), M_RANGE(1, MP_NUM_CHANNELS)},
         /* How often a redundant copy of the descriptors is carried, for a
-         * receiver that joins late; 0 carries none. */
+         * receiver that joins late; 0 carries none past the ones that follow
+         * a (re)start (LEAD_COPIES_MS). */
         {"copy-interval", OPT_INT(copy_interval_ms), M_RANGE(0, 60000)},
         {0}
     },
@@ -87,6 +97,12 @@ const struct m_sub_options ad_iamf_iec61937_conf = {
 /* Pd holds the low 16 bits of the payload length, Pc bits 8-12 the next
  * five. */
 #define MAX_PAYLOAD_BYTES ((1 << 21) - 1)
+
+/* How long after the burst that opens a sequence the units lead with a
+ * redundant copy of the descriptors, whatever the copy interval is. Past
+ * what an output loses while it starts (40 ms seen), short enough to cost
+ * nothing that counts. */
+#define LEAD_COPIES_MS 250
 
 #define OBU_CODEC_CONFIG 0
 #define OBU_MIX_PRESENTATION 2
@@ -110,11 +126,14 @@ struct priv {
     int period_frames;      // carrier frames one unit lasts
     int copy_every;         // units between redundant copies, 0: none
     int since_copy;         // units since the descriptors last went out
+    int lead_units;         // units that lead with a copy after an opening
+    int lead_left;          // of which still to make
     /* The stream (re)started and no burst has reached the audio output
      * since: set here, cleared when the player reports the first it sends.
      * Both under the wrapper's lock when the decoder has its own thread. */
     bool restart_pending;
     uint64_t too_long;      // units that did not fit their period
+    uint64_t copies_left_out; // copies dropped for their unit to fit
     struct mp_decoder public;
 };
 
@@ -201,6 +220,13 @@ static void put16le(uint8_t *out, unsigned v)
     out[1] = v >> 8;
 }
 
+/* A payload of that many bytes fits a burst of one period. */
+static bool burst_fits(size_t payload, size_t period)
+{
+    return payload <= MAX_PAYLOAD_BYTES &&
+           BURST_HEADER_BYTES + payload <= period;
+}
+
 static void process(struct mp_filter *da)
 {
     struct priv *p = da->priv;
@@ -237,15 +263,42 @@ static void process(struct mp_filter *da)
 
     /* A copy of the descriptors is skipped by a receiver that has the
      * sequence. While a restart is pending every burst leads with one: the
-     * player makes the first it sends the descriptors as they are. */
+     * player makes the first it sends the descriptors as they are. The units
+     * that follow that one lead with a copy too, for LEAD_COPIES_MS. */
     const uint8_t *lead = NULL;
-    if (p->restart_pending ||
+    if (p->restart_pending || p->lead_left > 0 ||
         (p->copy_every && p->since_copy >= p->copy_every))
         lead = p->redundant;
+    if (p->lead_left > 0)
+        p->lead_left--;
     size_t lead_len = lead ? p->descriptors_len : 0;
     size_t payload = lead_len + mpkt->len;
 
-    if (payload > MAX_PAYLOAD_BYTES || BURST_HEADER_BYTES + payload > period) {
+    /* A copy never costs its unit. When the two do not fit the period and
+     * the unit alone does, the unit goes out without the copy: of the ones
+     * that follow an opening, the next unit carries one anyway; one due by
+     * the interval stays due and goes with the next unit that has room.
+     * While a restart is pending the descriptors are not optional, the
+     * burst may be the one that opens the sequence: that unit is handled
+     * like one that does not fit by itself, below. */
+    if (lead && !p->restart_pending && !burst_fits(payload, period) &&
+        burst_fits(mpkt->len, period))
+    {
+        if (!(p->copies_left_out & (p->copies_left_out + 1))) {
+            MP_WARN(da, "a unit of %zu bytes leaves no room for a copy of "
+                        "the descriptors (%zu bytes) in its %zu-byte period "
+                        "on %d channels, sent without it: raise "
+                        "--ad-iamf-iec61937-channels (%" PRIu64 " so far)\n",
+                    (size_t)mpkt->len, lead_len, period, p->sstride / 2,
+                    p->copies_left_out + 1);
+        }
+        p->copies_left_out++;
+        lead = NULL;
+        lead_len = 0;
+        payload = mpkt->len;
+    }
+
+    if (!burst_fits(payload, period)) {
         /* The period goes out empty: the carrier keeps its time, the
          * receiver hears a gap. */
         if (!(p->too_long & (p->too_long + 1))) {
@@ -284,6 +337,7 @@ static void reset(struct mp_filter *da)
 {
     struct priv *p = da->priv;
     p->since_copy = 0;
+    p->lead_left = 0;
     p->restart_pending = true;
 }
 
@@ -323,7 +377,9 @@ bool ad_iamf_iec61937_leads_with_copy(struct mp_aframe *frame)
  * past everything that drops frames. If the stream (re)started and this is
  * the first to get there, its copy of the descriptors becomes the
  * descriptors as they are: the receiver opens a new sequence on it, where
- * its decoder starts afresh. */
+ * its decoder starts afresh. The units made from here on lead with a copy
+ * for LEAD_COPIES_MS; the ones made while the restart was pending, which
+ * the player has yet to send, already do. */
 static int control(struct mp_filter *da, enum dec_ctrl cmd, void *arg)
 {
     struct priv *p = da->priv;
@@ -354,6 +410,7 @@ static int control(struct mp_filter *da, enum dec_ctrl cmd, void *arg)
     if (!opened)
         return CONTROL_FALSE;
     p->restart_pending = false;
+    p->lead_left = p->lead_units;
     return CONTROL_TRUE;
 }
 
@@ -452,6 +509,11 @@ static struct mp_decoder *create(struct mp_filter *parent,
     p->sstride = sstride;
     p->period_frames = unit_samples;
     p->restart_pending = true;
+    /* The units that start within LEAD_COPIES_MS of the opening one's end,
+     * one at least. */
+    p->lead_units = MPCLAMP(((int64_t)LEAD_COPIES_MS * rate +
+                             1000LL * unit_samples - 1) /
+                            (1000LL * unit_samples), 1, INT32_MAX);
     if (opts->copy_interval_ms) {
         int64_t units = ((int64_t)opts->copy_interval_ms * rate + 500LL * unit_samples) /
                         (1000LL * unit_samples);
@@ -466,9 +528,11 @@ static struct mp_decoder *create(struct mp_filter *parent,
 
     MP_INFO(da, "IAMF as IEC 61937 bursts: %u-sample units on %d ch at %d Hz "
                 "(%d-byte period, %" PRId64 " kbit/s), descriptors (%zu bytes) "
-                "every %d unit(s)\n",
+                "with the %d unit(s) after a (re)start, then every %d "
+                "unit(s)\n",
             unit_samples, opts->channels, rate, p->period_frames * p->sstride,
-            (int64_t)p->sstride * rate / 125, desc_len, p->copy_every);
+            (int64_t)p->sstride * rate / 125, desc_len, p->lead_units,
+            p->copy_every);
 
     return &p->public;
 }
