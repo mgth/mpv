@@ -757,8 +757,8 @@ static void ao_process(struct mp_filter *f)
         // Past every drop: the first IAMF burst sent after a (re)start is
         // the one that opens the sequence at the receiver. Its decoder
         // knows whether one is pending; only bursts that lead with a copy
-        // of the descriptors are worth asking about (a few after a restart,
-        // then one per copy interval).
+        // of the descriptors are worth asking about (those of the quarter
+        // second after a restart, then one per copy interval).
         if (ao_c->track && ao_c->track->dec &&
             ad_iamf_iec61937_leads_with_copy(af))
         {
